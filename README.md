@@ -1,0 +1,56 @@
+# Kelp
+
+Kelp is the project manager for Kelyra.
+
+```sh
+cmake -S . -B build -G Ninja
+cmake --build build
+ctest --test-dir build --output-on-failure
+
+./build/kelp new hello
+cd hello
+kelp build
+kelp run
+```
+
+Projects are described by `kelp.toml`:
+
+```toml
+[project]
+name = "hello"
+version = "0.1.0"
+entry = "src/main.kly"
+
+[build]
+compiler = "kelyra"
+output = "build/hello"
+optimization = 0
+safe-level = 0
+c-sources = []
+c-args = []
+
+[package]
+output = "build/hello-0.1.0.tar.gz"
+
+[test]
+sources = []
+
+[dependencies.kstd]
+repository = "git@github.com:z8z6/kstd.git"
+revision = "main"
+```
+
+Supported commands are `new`, `init`, `check`, `build`, `run`, `test`, and
+`package`. `package` builds the project and creates the configured `.tar.gz`
+source archive.
+
+Dependencies use Git repositories. Kelp clones them into
+`.kelp/dependencies`, checks out `revision` when provided, and stages their
+Kelyra modules alongside the project sources. Their configured C sources are
+compiled into the final executable. Dependency names and staged module paths
+must not collide.
+
+Kelp searches parent directories for `kelp.toml`, so commands also work from a
+project subdirectory. The parser intentionally supports the TOML values used
+above: tables, quoted strings, non-negative integers, booleans, and string
+arrays.
