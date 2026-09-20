@@ -483,6 +483,7 @@ std::vector<std::string> CompilerCommand(const Config &Config,
                                          std::string Action) {
   std::vector<std::string> Result{Config.Compiler, std::move(Action)};
   if (Result[1] == "--emit-exe") {
+    Result.push_back("--progress");
     Result.push_back("-O" + std::to_string(Config.Optimization));
     Result.push_back("--safe-level=" + std::to_string(Config.SafeLevel));
     for (const auto &Source : Config.CSources)
@@ -502,13 +503,21 @@ int Check(const fs::path &Root, const Config &Config) {
 }
 
 int Build(const fs::path &Root, const Config &Config) {
+  std::cerr << "[1/3] Preparing " << Config.Name << '\n';
   std::error_code Error;
   fs::create_directories(Root / Config.Output.parent_path(), Error);
   if (Error)
     throw std::runtime_error("cannot create build directory: " +
                              Error.message());
   const auto Prepared = Prepare(Root, Config);
-  return Execute(Root, CompilerCommand(Prepared, "--emit-exe"));
+  std::cerr << "[2/3] Building " << Prepared.Entry.string() << " -> "
+            << Config.Output.string() << '\n';
+  const int Status = Execute(Root, CompilerCommand(Prepared, "--emit-exe"));
+  if (Status == 0)
+    std::cerr << "[3/3] Finished " << Config.Output.string() << '\n';
+  else
+    std::cerr << "Build failed (exit " << Status << ")\n";
+  return Status;
 }
 
 int Package(const fs::path &Root, const Config &Config) {
@@ -591,7 +600,8 @@ void Help() {
                "  new <name>    Create a project in ./<name>\n"
                "  init [name]   Create a project in the current directory\n"
                "  check         Type-check the project\n"
-               "  build         Build the project executable\n"
+               "  build [--debug] Build the executable (--debug uses -O0)\n"
+               "  output        Print the absolute executable path\n"
                "  run [-- ...]  Build and run the project\n"
                "  test          Check configured test sources\n"
                "  package       Build and create a source archive\n"
@@ -635,9 +645,18 @@ int main(int Argc, char **Argv) {
       return Check(Root, Project);
     }
     if (Command == "build") {
+      if (Argc != 2 && !(Argc == 3 && std::string_view(Argv[2]) == "--debug"))
+        throw std::runtime_error("usage: kelp build [--debug]");
+      auto BuildProject = Project;
+      if (Argc == 3)
+        BuildProject.Optimization = 0;
+      return Build(Root, BuildProject);
+    }
+    if (Command == "output") {
       if (Argc != 2)
-        throw std::runtime_error("usage: kelp build");
-      return Build(Root, Project);
+        throw std::runtime_error("usage: kelp output");
+      std::cout << (Root / Project.Output).string() << '\n';
+      return 0;
     }
     if (Command == "run") {
       if (const int Status = Build(Root, Project))

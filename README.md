@@ -40,9 +40,17 @@ repository = "git@github.com:z8z6/kstd.git"
 revision = "main"
 ```
 
-Supported commands are `new`, `init`, `check`, `build`, `run`, `test`, and
+Supported commands are `new`, `init`, `check`, `build`, `output`, `run`, `test`, and
 `package`. `package` builds the project and creates the configured `.tar.gz`
 source archive.
+
+`build --debug` overrides optimization with `-O0` without changing `kelp.toml`.
+`output` prints the absolute configured executable path without building or
+fetching dependencies; editor integrations use it to configure a debugger.
+Builds report preparation, compilation, and completion on stderr, including the
+entry/output paths. Kelyra's `--progress` lists every loaded `.kly` module, C header,
+C source, and the code-generation/link stages. These are phase counters, not
+time-based percentages; a failed build never reports successful completion.
 
 Dependencies use Git repositories. Kelp clones them into
 `.kelp/dependencies`, checks out `revision` when provided, and stages their

@@ -17,6 +17,7 @@ cat > fake-kelyra <<'EOF'
 #!/bin/sh
 set -eu
 output=
+if [ "${FAKE_KELYRA_FAIL:-0}" = 1 ]; then exit 1; fi
 if [ -n "${FAKE_KELYRA_LOG:-}" ]; then
   printf '%s\n' "$@" > "$FAKE_KELYRA_LOG"
 fi
@@ -44,6 +45,31 @@ cd demo
 test -x build/demo
 test "$("$kelp" run)" = kelp-run-ok
 "$kelp" test
+
+test "$("$kelp" output)" = "$tmp/demo/build/demo"
+sed -i 's/optimization = 0/optimization = 3/' kelp.toml
+export FAKE_KELYRA_LOG=$tmp/debug-arguments
+"$kelp" build --debug 2>"$tmp/progress"
+grep -q '\[1/3\] Preparing demo' "$tmp/progress"
+grep -q '\[2/3\] Building src/main.kly' "$tmp/progress"
+grep -q '\[3/3\] Finished build/demo' "$tmp/progress"
+grep -qx -- '--progress' "$FAKE_KELYRA_LOG"
+grep -qx -- '-O0' "$FAKE_KELYRA_LOG"
+"$kelp" build
+grep -qx -- '-O3' "$FAKE_KELYRA_LOG"
+if FAKE_KELYRA_FAIL=1 "$kelp" build 2>"$tmp/failed-progress"; then
+  echo "compiler failure was ignored" >&2
+  exit 1
+fi
+grep -q 'Build failed (exit 1)' "$tmp/failed-progress"
+if grep -q 'Finished' "$tmp/failed-progress"; then exit 1; fi
+if "$kelp" build --invalid >/dev/null 2>&1; then
+  echo "invalid build option was accepted" >&2
+  exit 1
+fi
+cd src
+test "$("$kelp" output)" = "$tmp/demo/build/demo"
+cd ..
 
 printf '\nunknown = true\n' >> kelp.toml
 if "$kelp" check >/dev/null 2>&1; then
