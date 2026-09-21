@@ -391,6 +391,22 @@ struct ProjectNode {
   Config Project;
 };
 
+// Returns the outermost ancestor manifest (including Root) that declares a
+// workspace, so a build started inside one member still shares its cache.
+fs::path FindWorkspaceRoot(const fs::path &Root) {
+  fs::path Result = Root;
+  for (auto Current = Root.parent_path();
+       !Current.empty() && Current != Current.root_path();
+       Current = Current.parent_path()) {
+    if (!fs::exists(Current / "kelp.toml"))
+      continue;
+    const auto Values = ParseToml(Current / "kelp.toml");
+    if (Values.count("workspace.members"))
+      Result = Current;
+  }
+  return Result;
+}
+
 void LoadWorkspace(const fs::path &Root, std::vector<ProjectNode> &Nodes,
                    std::set<std::string> &Seen) {
   const auto Key = fs::weakly_canonical(Root).string();
@@ -412,9 +428,10 @@ std::vector<ProjectNode> LoadWorkspace(const fs::path &Root) {
   std::vector<ProjectNode> Nodes;
   std::set<std::string> Seen;
   LoadWorkspace(Root, Nodes, Seen);
-  // Every member shares the workspace root's Git dependency cache.
+  // Every member shares the outermost enclosing workspace dependency cache.
+  const auto CacheRoot = FindWorkspaceRoot(Root);
   for (auto &Node : Nodes)
-    Node.Project.CacheRoot = Root;
+    Node.Project.CacheRoot = CacheRoot;
   return Nodes;
 }
 

@@ -120,10 +120,11 @@ given for one dependency, never both. Path and Git dependencies may mix in one
 project, and both participate in cycle detection.
 
 In a workspace, every member shares the workspace root's `.kelp/dependencies`
-cache, so a Git dependency is cloned and fetched once for the whole tree instead
-of once per member. If two members request the same dependency name from
-different repositories or revisions, Kelp reports a conflict rather than
-silently repointing the shared cache.
+cache, even when a command runs from inside a member, so a Git dependency is
+cloned and fetched once for the whole tree instead of once per member. If two
+members request the same dependency name from different repositories or
+revisions, Kelp reports a conflict rather than silently repointing the shared
+cache.
 
 Kelp searches parent directories for `kelp.toml`, so commands also work from a
 project subdirectory. The parser intentionally supports the TOML values used

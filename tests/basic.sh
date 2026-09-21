@@ -303,4 +303,7 @@ test ! -e a/.kelp
 test ! -e b/.kelp
 # The cached dependency is reused by a later run without a second checkout.
 "$kelp" build --workspace
+# A build started inside one member still uses the enclosing workspace cache.
+(cd a && "$kelp" build)
+test ! -e a/.kelp
 cd "$tmp"
