@@ -56,6 +56,8 @@ struct Config {
   std::vector<fs::path> WorkspaceMembers;
   // Git dependency cache shared by a workspace; empty for a standalone project.
   fs::path CacheRoot;
+  // Absolute directory that holds this project's artifacts.
+  fs::path BuildRoot;
   std::vector<Dependency> Dependencies;
 };
 
@@ -430,6 +432,61 @@ fs::path FindWorkspaceRoot(const fs::path &Root) {
   return Result;
 }
 
+// Every project builds into the workspace cache instead of a `build` directory
+// of its own. Each project keeps a subtree that mirrors where it sits, so
+// `libs/math` builds into `.kelp/build/libs/math`. A project outside the
+// workspace, such as a path dependency next door, uses its directory name.
+fs::path BuildDirectory(const fs::path &Root, const fs::path &CacheRoot) {
+  const auto Base = (CacheRoot.empty() ? Root : CacheRoot) / ".kelp/build";
+  if (CacheRoot.empty())
+    return Base.lexically_normal();
+  std::error_code Error;
+  const auto Relative = fs::relative(Root, CacheRoot, Error);
+  if (Error || Relative.empty() || Relative == ".")
+    return Base.lexically_normal();
+  if (Relative.begin() != Relative.end() && *Relative.begin() == "..")
+    return (Base / Root.filename()).lexically_normal();
+  return (Base / Relative).lexically_normal();
+}
+
+// A declared output is relative to the project's build directory. Manifests
+// written before the move say `build/<name>`, so that leading directory keeps
+// its meaning as the build directory itself.
+fs::path BuildArtifact(const Config &Project, const fs::path &Declared) {
+  auto Relative = Declared.lexically_normal();
+  if (Relative.begin() != Relative.end() && *Relative.begin() == "build") {
+    const auto Stripped = Relative.lexically_relative("build");
+    Relative =
+        Stripped.empty() || Stripped == "." ? Declared.filename() : Stripped;
+  }
+  const auto Base =
+      Project.BuildRoot.empty() ? fs::path(".kelp/build") : Project.BuildRoot;
+  return (Base / Relative).lexically_normal();
+}
+
+fs::path ArtifactPath(const Config &Project) {
+  return BuildArtifact(Project, Project.Output);
+}
+
+fs::path PackagePath(const Config &Project) {
+  return BuildArtifact(Project, Project.PackageOutput);
+}
+
+// The workspace a project belongs to, which owns the shared build directory.
+const fs::path &WorkspaceOf(const Config &Project, const fs::path &Root) {
+  return Project.CacheRoot.empty() ? Root : Project.CacheRoot;
+}
+
+// Shortens a path for progress output without ever escaping the project.
+std::string DisplayPath(const fs::path &Root, const fs::path &Path) {
+  std::error_code Error;
+  const auto Relative = fs::relative(Path, Root, Error);
+  if (Error || Relative.empty() ||
+      (Relative.begin() != Relative.end() && *Relative.begin() == ".."))
+    return Path.string();
+  return Relative.string();
+}
+
 void LoadWorkspace(const fs::path &Root, std::vector<ProjectNode> &Nodes,
                    std::set<std::string> &Seen) {
   const auto Key = fs::weakly_canonical(Root).string();
@@ -453,8 +510,10 @@ std::vector<ProjectNode> LoadWorkspace(const fs::path &Root) {
   LoadWorkspace(Root, Nodes, Seen);
   // Every member shares the outermost enclosing workspace dependency cache.
   const auto CacheRoot = FindWorkspaceRoot(Root);
-  for (auto &Node : Nodes)
+  for (auto &Node : Nodes) {
     Node.Project.CacheRoot = CacheRoot;
+    Node.Project.BuildRoot = BuildDirectory(Node.Root, CacheRoot);
+  }
   return Nodes;
 }
 
@@ -738,11 +797,10 @@ PreparedProject Prepare(const fs::path &Root, const Config &Project) {
     if (Dependency.Project.Kind == BuildKind::Library) {
       // A library dependency is compiled once into its own object: consumers
       // only declare its modules and link the object.
+      auto DependencyProject = Dependency.Project;
+      DependencyProject.BuildRoot = BuildDirectory(Dependency.Root, CacheRoot);
       Result.ExternalPaths.push_back(AbsoluteSourceRoot.string());
-      Result.LinkInputs.push_back(
-          fs::absolute(Dependency.Root / Dependency.Project.Output)
-              .lexically_normal()
-              .string());
+      Result.LinkInputs.push_back(ArtifactPath(DependencyProject).string());
     }
     Prepared.Dependencies.push_back(Dependency);
   }
@@ -771,7 +829,7 @@ std::vector<std::string> CompilerCommand(const Config &Config,
     for (const auto &Argument : Config.CArguments)
       Result.push_back("--c-arg=" + Argument);
     Result.push_back("-o");
-    Result.push_back(Config.Output.string());
+    Result.push_back(ArtifactPath(Config).string());
   }
   Result.push_back(Config.Entry.string());
   return Result;
@@ -799,7 +857,7 @@ int Build(const fs::path &Root, const Config &Config,
       Config.Kind == BuildKind::Library ? "--emit-obj" : "--emit-exe";
   std::cerr << "[1/3] Preparing " << Config.Name << '\n';
   std::error_code Error;
-  fs::create_directories(Root / Config.Output.parent_path(), Error);
+  fs::create_directories(ArtifactPath(Config).parent_path(), Error);
   if (Error)
     throw std::runtime_error("cannot create build directory: " +
                              Error.message());
@@ -812,16 +870,20 @@ int Build(const fs::path &Root, const Config &Config,
       auto LibraryProject = Dependency.Project;
       LibraryProject.Compiler = Prepared.Project.Compiler;
       LibraryProject.CacheRoot = Config.CacheRoot;
+      LibraryProject.BuildRoot =
+          BuildDirectory(Dependency.Root, Config.CacheRoot);
       if (const int Status = Build(Dependency.Root, LibraryProject, Built))
         return Status;
     }
   std::cerr << "[2/3] Building " << Prepared.Project.Entry.string() << " -> "
-            << Config.Output.string() << '\n';
+            << DisplayPath(WorkspaceOf(Config, Root), ArtifactPath(Config))
+            << '\n';
   Timer Timer;
   const int Status = Execute(Root, CompilerCommand(Prepared.Project, Action));
   if (Status == 0)
-    std::cerr << "[3/3] Finished " << Config.Output.string() << " in "
-              << FormatDuration(Timer.Seconds()) << '\n';
+    std::cerr << "[3/3] Finished "
+              << DisplayPath(WorkspaceOf(Config, Root), ArtifactPath(Config))
+              << " in " << FormatDuration(Timer.Seconds()) << '\n';
   else
     std::cerr << "Build failed (exit " << Status << ") after "
               << FormatDuration(Timer.Seconds()) << '\n';
@@ -839,7 +901,7 @@ int RunProject(const ProjectNode &Node,
     throw std::runtime_error("library projects cannot be run");
   if (const int Status = Build(Node.Root, Node.Project))
     return Status;
-  std::vector<std::string> Command{(Node.Root / Node.Project.Output).string()};
+  std::vector<std::string> Command{ArtifactPath(Node.Project).string()};
   Command.insert(Command.end(), Arguments.begin(), Arguments.end());
   return Execute(Node.Root, Command);
 }
@@ -849,20 +911,21 @@ int Package(const fs::path &Root, const Config &Config,
   if (const int Status = Build(Root, Config, Built))
     return Status;
   std::error_code Error;
-  fs::create_directories(Root / Config.PackageOutput.parent_path(), Error);
+  fs::create_directories(PackagePath(Config).parent_path(), Error);
   if (Error)
     throw std::runtime_error("cannot create package directory: " +
                              Error.message());
   std::vector<std::string> Arguments{"tar", "-czf",
-                                     Config.PackageOutput.string(), "kelp.toml",
+                                     PackagePath(Config).string(), "kelp.toml",
                                      Config.Entry.parent_path().string()};
   if (fs::exists(Root / "README.md"))
     Arguments.push_back("README.md");
   Timer Timer;
   const int Status = Execute(Root, Arguments);
   if (Status == 0)
-    std::cerr << "packaged " << Config.PackageOutput.string() << " in "
-              << FormatDuration(Timer.Seconds()) << '\n';
+    std::cerr << "packaged "
+              << DisplayPath(WorkspaceOf(Config, Root), PackagePath(Config))
+              << " in " << FormatDuration(Timer.Seconds()) << '\n';
   return Status;
 }
 
@@ -896,7 +959,7 @@ void CreateProject(const fs::path &Root, std::string Name) {
           "entry = \"src/main.kly\"\n\n"
           "[build]\n"
           "compiler = \"kelyra\"\n"
-          "output = \"build/"
+          "output = \""
        << Name
        << "\"\n"
           "optimization = 0\n"
@@ -904,7 +967,7 @@ void CreateProject(const fs::path &Root, std::string Name) {
           "c-sources = []\n"
           "c-args = []\n\n"
           "[package]\n"
-          "output = \"build/"
+          "output = \""
        << Name
        << "-0.1.0.tar.gz\"\n\n"
           "[test]\n"
@@ -918,7 +981,7 @@ void CreateProject(const fs::path &Root, std::string Name) {
   Main << "pub fn main() -> i32 {\n  return 0;\n}\n";
   if (!fs::exists(Root / ".gitignore")) {
     std::ofstream Ignore(Root / ".gitignore");
-    Ignore << "/build/\n/.kelp/\n";
+    Ignore << "/.kelp/\n";
   }
   std::cout << "created " << Name << " in " << Root << '\n';
 }
@@ -982,8 +1045,9 @@ int main(int Argc, char **Argv) {
         std::cout << RelativeNodePath(Node.Root, Root) << ' '
                   << (Node.Project.HasProject ? Node.Project.Name : "-") << ' '
                   << ProjectKindName(Node.Project) << ' '
-                  << (Node.Project.HasProject ? Node.Project.Output.string()
-                                              : std::string("-"))
+                  << (Node.Project.HasProject
+                          ? DisplayPath(Root, ArtifactPath(Node.Project))
+                          : std::string("-"))
                   << '\n';
       return 0;
     }
@@ -1021,9 +1085,7 @@ int main(int Argc, char **Argv) {
     if (Command == "output") {
       const auto Options = ParseCommandOptions(Argc, Argv, false);
       const auto Targets = SelectTargets(Nodes, Options, true);
-      std::cout
-          << (Targets.front()->Root / Targets.front()->Project.Output).string()
-          << '\n';
+      std::cout << ArtifactPath(Targets.front()->Project).string() << '\n';
       return 0;
     }
     if (Command == "run") {

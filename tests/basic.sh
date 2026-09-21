@@ -12,6 +12,10 @@ cd "$tmp"
 "$kelp" new demo
 test -f demo/kelp.toml
 test -f demo/src/main.kly
+# Generated manifests name the artifact, not a build directory, and the layout
+# ignores only the shared cache.
+grep -qx 'output = "demo"' demo/kelp.toml
+grep -qx '/.kelp/' demo/.gitignore
 
 cat > fake-kelyra <<'EOF'
 #!/bin/sh
@@ -42,17 +46,18 @@ sed -i "s|compiler = \"kelyra\"|compiler = \"$fake\"|" demo/kelp.toml
 cd demo
 "$kelp" check
 "$kelp" build
-test -x build/demo
+test -x .kelp/build/demo
+test ! -e build
 test "$("$kelp" run)" = kelp-run-ok
 "$kelp" test
 
-test "$("$kelp" output)" = "$tmp/demo/build/demo"
+test "$("$kelp" output)" = "$tmp/demo/.kelp/build/demo"
 sed -i 's/optimization = 0/optimization = 3/' kelp.toml
 export FAKE_KELYRA_LOG=$tmp/debug-arguments
 "$kelp" build --debug 2>"$tmp/progress"
 grep -q '\[1/3\] Preparing demo' "$tmp/progress"
 grep -q '\[2/3\] Building src/main.kly' "$tmp/progress"
-grep -q '\[3/3\] Finished build/demo' "$tmp/progress"
+grep -q '\[3/3\] Finished .kelp/build/demo' "$tmp/progress"
 grep -qx -- '--progress' "$FAKE_KELYRA_LOG"
 grep -qx -- '-O0' "$FAKE_KELYRA_LOG"
 "$kelp" build
@@ -68,7 +73,7 @@ if "$kelp" build --invalid >/dev/null 2>&1; then
   exit 1
 fi
 cd src
-test "$("$kelp" output)" = "$tmp/demo/build/demo"
+test "$("$kelp" output)" = "$tmp/demo/.kelp/build/demo"
 cd ..
 
 printf '\nunknown = true\n' >> kelp.toml
@@ -122,9 +127,9 @@ grep -qx -- "--module-path=$tmp/consumer/.kelp/dependencies/demo/src" \
 grep -q -- "--c-source=$tmp/consumer/.kelp/dependencies/demo/src/demo/runtime.c" \
   "$FAKE_KELYRA_LOG"
 "$kelp" package
-test -f build/consumer-0.1.0.tar.gz
-tar -tzf build/consumer-0.1.0.tar.gz | grep -q '^kelp.toml$'
-tar -tzf build/consumer-0.1.0.tar.gz | grep -q '^src/main.kly$'
+test -f .kelp/build/consumer-0.1.0.tar.gz
+tar -tzf .kelp/build/consumer-0.1.0.tar.gz | grep -q '^kelp.toml$'
+tar -tzf .kelp/build/consumer-0.1.0.tar.gz | grep -q '^src/main.kly$'
 cd "$tmp"
 
 # A workspace nests subprojects, each with its own kelp.toml. A library project
@@ -163,20 +168,23 @@ printf 'pub fn main() -> i32 { return 0; }\n' > workspace/app/src/main.kly
 printf 'int app_runtime(void) { return 0; }\n' > workspace/app/src/runtime.c
 
 cd workspace
-"$kelp" members | grep -qx 'libs/math math library build/math.o'
-"$kelp" members | grep -qx 'app app executable build/app'
+"$kelp" members | grep -qx 'libs/math math library .kelp/build/libs/math/math.o'
+"$kelp" members | grep -qx 'app app executable .kelp/build/app/app'
 "$kelp" members | grep -qx '. - workspace -'
 
 # A workspace root without [project] builds every member by default.
 "$kelp" build
-test -f libs/math/build/math.o
-test -x app/build/app
+test -f .kelp/build/libs/math/math.o
+test -x .kelp/build/app/app
+# Only the shared build directory is written; projects stay clean.
+test ! -e libs/math/build
+test ! -e app/build
 
 # A selector builds or queries only that member.
-rm -f libs/math/build/math.o
+rm -f .kelp/build/libs/math/math.o
 "$kelp" build math
-test -f libs/math/build/math.o
-test "$("$kelp" output app)" = "$tmp/workspace/app/build/app"
+test -f .kelp/build/libs/math/math.o
+test "$("$kelp" output app)" = "$tmp/workspace/.kelp/build/app/app"
 if "$kelp" build missing >/dev/null 2>&1; then
   echo "unknown workspace member was accepted" >&2
   exit 1
@@ -195,18 +203,18 @@ rm -rf app/build
 grep -qx -- 'src/main.kly' "$FAKE_KELYRA_LOG"
 grep -qx -- "--module-path=$tmp/workspace/libs/math/src" "$FAKE_KELYRA_LOG"
 grep -qx -- "--external-path=$tmp/workspace/libs/math/src" "$FAKE_KELYRA_LOG"
-grep -qx -- "--link-input=$tmp/workspace/libs/math/build/math.o" \
+grep -qx -- "--link-input=$tmp/workspace/.kelp/build/libs/math/math.o" \
   "$FAKE_KELYRA_LOG"
 grep -q -- "--c-source=src/runtime.c" "$FAKE_KELYRA_LOG"
-test -f libs/math/build/math.o
+test -f .kelp/build/libs/math/math.o
 test ! -e app/.kelp
 
 # check, test, and package accept --workspace.
 "$kelp" check --workspace
 "$kelp" test --workspace
 "$kelp" package --workspace
-test -f libs/math/build/math.o
-test -f app/build/app-0.1.0.tar.gz
+test -f .kelp/build/libs/math/math.o
+test -f .kelp/build/app/app-0.1.0.tar.gz
 
 # Commands report wall-clock durations on stderr. A multi-project selection adds
 # a total line; a single project reports only its own duration.
@@ -252,10 +260,10 @@ printf 'pub fn main() -> i32 { return 0; }\n' > combined/src/main.kly
 printf 'pub fn main() -> i32 { return 0; }\n' > combined/child/src/main.kly
 cd combined
 "$kelp" build
-test -x build/combined
+test -x .kelp/build/combined
 test ! -e child/build
 "$kelp" build --workspace
-test -x child/build/child
+test -x .kelp/build/child/child
 cd "$tmp"
 
 # Path dependencies participate in cycle detection.
@@ -362,6 +370,6 @@ EOF
 printf 'pub fn main() -> i32 { return 0; }\n' > toolchain/app/src/main.kly
 cd toolchain
 "$kelp" build app
-test -f lib/build/lib.o
-test -x app/build/app
+test -f .kelp/build/lib/lib.o
+test -x .kelp/build/app/app
 cd "$tmp"

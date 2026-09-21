@@ -24,14 +24,14 @@ entry = "src/main.kly"
 [build]
 compiler = "kelyra"
 kind = "executable"
-output = "build/hello"
+output = "hello"
 optimization = 0
 safe-level = 0
 c-sources = []
 c-args = []
 
 [package]
-output = "build/hello-0.1.0.tar.gz"
+output = "hello-0.1.0.tar.gz"
 
 [test]
 sources = []
@@ -93,8 +93,16 @@ artifact path.
 `build.kind` selects what `kelp build` produces:
 
 - `executable` (default) links an executable at `build.output`;
-- `library` compiles the project to an object file (default `build/<name>.o`)
-  and rejects `kelp run`.
+- `library` compiles the project to an object file (default `<name>.o`) and
+  rejects `kelp run`.
+
+Every project builds into the workspace cache instead of a `build` directory of
+its own. Artifacts live at `.kelp/build/<project path>`, so `libs/math` produces
+`.kelp/build/libs/math/math.o` and the workspace root project produces
+`.kelp/build/<name>`. `build.output` and `package.output` name the artifact
+inside that directory; a leading `build/` written by older manifests still
+means the directory itself. A single ignored `.kelp/` therefore covers every
+project, and `kelp members` reports the path relative to the workspace root.
 
 A library is compiled once and linked, not copied into every consumer. When a
 project depends on a library, Kelp builds that library's object, passes its
