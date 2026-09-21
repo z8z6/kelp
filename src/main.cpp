@@ -41,6 +41,7 @@ struct Config {
   unsigned SafeLevel = 0;
   std::vector<std::string> CSources;
   std::vector<std::string> CArguments;
+  std::vector<std::string> ModulePaths;
   std::vector<std::string> TestSources;
   std::vector<Dependency> Dependencies;
 };
@@ -423,49 +424,26 @@ std::vector<ResolvedDependency> ResolveDependencies(const fs::path &Root,
   return Result;
 }
 
-void CopyTree(const fs::path &Source, const fs::path &Destination) {
-  if (!fs::is_directory(Source))
-    throw std::runtime_error("source directory does not exist: " +
-                             Source.string());
-  fs::create_directories(Destination);
-  for (const auto &Entry : fs::recursive_directory_iterator(Source)) {
-    const auto Relative = fs::relative(Entry.path(), Source);
-    const auto Target = Destination / Relative;
-    if (Entry.is_symlink())
-      throw std::runtime_error("symbolic links are not allowed in package "
-                               "sources: " +
-                               Entry.path().string());
-    if (Entry.is_directory()) {
-      fs::create_directories(Target);
-      continue;
-    }
-    if (!Entry.is_regular_file())
-      continue;
-    fs::create_directories(Target.parent_path());
-    if (fs::exists(Target))
-      throw std::runtime_error("dependency source collision: " +
-                               Target.string());
-    fs::copy_file(Entry.path(), Target);
-  }
-}
-
 Config Prepare(const fs::path &Root, const Config &Project) {
-  if (Project.Dependencies.empty())
-    return Project;
-  const auto Dependencies = ResolveDependencies(Root, Project);
-  const auto Stage = Root / ".kelp/stage";
-  std::error_code Error;
-  fs::remove_all(Stage, Error);
-  if (Error)
-    throw std::runtime_error("cannot reset dependency stage: " +
-                             Error.message());
-
   Config Result = Project;
-  const auto SourceRoot = Project.Entry.parent_path();
-  CopyTree(Root / SourceRoot, Stage / SourceRoot);
-  for (const auto &Dependency : Dependencies) {
+  // Sources are compiled where they live. Instead of copying the project and
+  // dependency sources into a staging tree, every source directory is passed
+  // to the compiler as a module search path.
+  Result.ModulePaths.push_back(fs::absolute(Root / Project.Entry.parent_path())
+                                   .lexically_normal()
+                                   .string());
+  // Remove the staging tree created by older Kelp versions so no stale copies
+  // remain next to the originals.
+  std::error_code Error;
+  fs::remove_all(Root / ".kelp/stage", Error);
+  if (Project.Dependencies.empty())
+    return Result;
+  for (const auto &Dependency : ResolveDependencies(Root, Project)) {
     const auto DependencySourceRoot = Dependency.Project.Entry.parent_path();
-    CopyTree(Dependency.Root / DependencySourceRoot, Stage / SourceRoot);
+    Result.ModulePaths.push_back(
+        fs::absolute(Dependency.Root / DependencySourceRoot)
+            .lexically_normal()
+            .string());
     for (const auto &Source : Dependency.Project.CSources)
       Result.CSources.push_back(
           fs::absolute(Dependency.Root / Source).string());
@@ -473,15 +451,14 @@ Config Prepare(const fs::path &Root, const Config &Project) {
                              Dependency.Project.CArguments.begin(),
                              Dependency.Project.CArguments.end());
   }
-  Result.Entry = fs::relative(Stage / Project.Entry, Root);
-  for (auto &Source : Result.TestSources)
-    Source = fs::relative(Stage / Source, Root).string();
   return Result;
 }
 
 std::vector<std::string> CompilerCommand(const Config &Config,
                                          std::string Action) {
   std::vector<std::string> Result{Config.Compiler, std::move(Action)};
+  for (const auto &Path : Config.ModulePaths)
+    Result.push_back("--module-path=" + Path);
   if (Result[1] == "--emit-exe") {
     Result.push_back("--progress");
     Result.push_back("-O" + std::to_string(Config.Optimization));

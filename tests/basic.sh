@@ -114,7 +114,11 @@ EOF
 export FAKE_KELYRA_LOG=$tmp/compiler-arguments
 cd consumer
 "$kelp" build
-test -f .kelp/stage/src/demo/lib.kly
+test ! -e .kelp/stage
+grep -qx -- 'src/main.kly' "$FAKE_KELYRA_LOG"
+grep -qx -- "--module-path=$tmp/consumer/src" "$FAKE_KELYRA_LOG"
+grep -qx -- "--module-path=$tmp/consumer/.kelp/dependencies/demo/src" \
+  "$FAKE_KELYRA_LOG"
 grep -q -- "--c-source=$tmp/consumer/.kelp/dependencies/demo/src/demo/runtime.c" \
   "$FAKE_KELYRA_LOG"
 "$kelp" package

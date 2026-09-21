@@ -53,10 +53,13 @@ C source, and the code-generation/link stages. These are phase counters, not
 time-based percentages; a failed build never reports successful completion.
 
 Dependencies use Git repositories. Kelp clones them into
-`.kelp/dependencies`, checks out `revision` when provided, and stages their
-Kelyra modules alongside the project sources. Their configured C sources are
-compiled into the final executable. Dependency names and staged module paths
-must not collide.
+`.kelp/dependencies`, checks out `revision` when provided, and passes each
+dependency source directory to Kelyra as a `--module-path` search directory.
+Their configured C sources are compiled into the final executable. Sources are
+compiled where they live: Kelp never copies them into a staging tree, so
+diagnostics and debug information point at the real files. Modules in the
+project's own source directory take priority, followed by dependency
+directories in resolution order.
 
 Kelp searches parent directories for `kelp.toml`, so commands also work from a
 project subdirectory. The parser intentionally supports the TOML values used
