@@ -50,6 +50,8 @@ struct Config {
   std::vector<std::string> ModulePaths;
   std::vector<std::string> TestSources;
   std::vector<fs::path> WorkspaceMembers;
+  // Git dependency cache shared by a workspace; empty for a standalone project.
+  fs::path CacheRoot;
   std::vector<Dependency> Dependencies;
 };
 
@@ -410,6 +412,9 @@ std::vector<ProjectNode> LoadWorkspace(const fs::path &Root) {
   std::vector<ProjectNode> Nodes;
   std::set<std::string> Seen;
   LoadWorkspace(Root, Nodes, Seen);
+  // Every member shares the workspace root's Git dependency cache.
+  for (auto &Node : Nodes)
+    Node.Project.CacheRoot = Root;
   return Nodes;
 }
 
@@ -537,6 +542,19 @@ struct ResolvedDependency {
   Config Project;
 };
 
+struct DependencyUse {
+  std::string Repository;
+  std::string Revision;
+};
+
+// Records where each cache directory was resolved from during one Kelp run, so
+// a workspace shares one cache without silently repointing another member's
+// dependency.
+std::map<std::string, DependencyUse> &DependencyUses() {
+  static std::map<std::string, DependencyUse> Uses;
+  return Uses;
+}
+
 void ResolveDependencies(const fs::path &CacheRoot, const fs::path &ProjectRoot,
                          const Config &Project,
                          std::vector<ResolvedDependency> &Result,
@@ -565,34 +583,47 @@ void ResolveDependencies(const fs::path &CacheRoot, const fs::path &ProjectRoot,
       throw std::runtime_error("cyclic dependency involving '" +
                                Dependency.Name + "'");
     if (!Dependency.Local) {
-      if (!fs::exists(DependencyRoot)) {
-        std::cout << "fetching " << Dependency.Name << " from "
-                  << Dependency.Repository << '\n';
-        if (const int Status = Execute(
-                ProjectRoot, {"git", "clone", "--quiet", "--",
-                              Dependency.Repository, DependencyRoot.string()}))
-          throw std::runtime_error("git clone failed with status " +
+      auto &Uses = DependencyUses();
+      const auto Use = Uses.find(Key);
+      if (Use != Uses.end()) {
+        if (Use->second.Repository != Dependency.Repository ||
+            Use->second.Revision != Dependency.Revision)
+          throw std::runtime_error("workspace dependency '" + Dependency.Name +
+                                   "' is requested from conflicting sources");
+      } else {
+        if (!fs::exists(DependencyRoot)) {
+          std::cout << "fetching " << Dependency.Name << " from "
+                    << Dependency.Repository << '\n';
+          if (const int Status =
+                  Execute(ProjectRoot,
+                          {"git", "clone", "--quiet", "--",
+                           Dependency.Repository, DependencyRoot.string()}))
+            throw std::runtime_error("git clone failed with status " +
+                                     std::to_string(Status));
+        } else if (!fs::exists(DependencyRoot / ".git")) {
+          throw std::runtime_error(
+              "dependency cache is not a Git repository: " +
+              DependencyRoot.string());
+        } else if (const int Status = Execute(
+                       DependencyRoot, {"git", "remote", "set-url", "origin",
+                                        Dependency.Repository})) {
+          throw std::runtime_error("cannot update dependency remote, status " +
                                    std::to_string(Status));
-      } else if (!fs::exists(DependencyRoot / ".git")) {
-        throw std::runtime_error("dependency cache is not a Git repository: " +
-                                 DependencyRoot.string());
-      } else if (const int Status = Execute(
-                     DependencyRoot, {"git", "remote", "set-url", "origin",
-                                      Dependency.Repository})) {
-        throw std::runtime_error("cannot update dependency remote, status " +
-                                 std::to_string(Status));
-      }
-      if (!Dependency.Revision.empty()) {
-        if (const int Status =
-                Execute(DependencyRoot, {"git", "fetch", "--quiet", "origin",
-                                         Dependency.Revision}))
-          throw std::runtime_error("git fetch failed with status " +
-                                   std::to_string(Status));
-        if (const int Status =
-                Execute(DependencyRoot, {"git", "checkout", "--quiet",
-                                         "--detach", "FETCH_HEAD"}))
-          throw std::runtime_error("git checkout failed with status " +
-                                   std::to_string(Status));
+        }
+        if (!Dependency.Revision.empty()) {
+          if (const int Status =
+                  Execute(DependencyRoot, {"git", "fetch", "--quiet", "origin",
+                                           Dependency.Revision}))
+            throw std::runtime_error("git fetch failed with status " +
+                                     std::to_string(Status));
+          if (const int Status =
+                  Execute(DependencyRoot, {"git", "checkout", "--quiet",
+                                           "--detach", "FETCH_HEAD"}))
+            throw std::runtime_error("git checkout failed with status " +
+                                     std::to_string(Status));
+        }
+        Uses.emplace(Key,
+                     DependencyUse{Dependency.Repository, Dependency.Revision});
       }
     }
     auto DependencyProject = LoadConfig(DependencyRoot);
@@ -607,12 +638,14 @@ void ResolveDependencies(const fs::path &CacheRoot, const fs::path &ProjectRoot,
   }
 }
 
-std::vector<ResolvedDependency> ResolveDependencies(const fs::path &Root,
+std::vector<ResolvedDependency> ResolveDependencies(const fs::path &CacheRoot,
+                                                    const fs::path &ProjectRoot,
                                                     const Config &Project) {
   std::vector<ResolvedDependency> Result;
   std::set<std::string> Resolving;
   std::set<std::string> Resolved;
-  ResolveDependencies(Root, Root, Project, Result, Resolving, Resolved);
+  ResolveDependencies(CacheRoot, ProjectRoot, Project, Result, Resolving,
+                      Resolved);
   return Result;
 }
 
@@ -630,7 +663,8 @@ Config Prepare(const fs::path &Root, const Config &Project) {
   fs::remove_all(Root / ".kelp/stage", Error);
   if (Project.Dependencies.empty())
     return Result;
-  for (const auto &Dependency : ResolveDependencies(Root, Project)) {
+  const auto CacheRoot = Project.CacheRoot.empty() ? Root : Project.CacheRoot;
+  for (const auto &Dependency : ResolveDependencies(CacheRoot, Root, Project)) {
     const auto DependencySourceRoot = Dependency.Project.Entry.parent_path();
     Result.ModulePaths.push_back(
         fs::absolute(Dependency.Root / DependencySourceRoot)

@@ -273,3 +273,34 @@ if "$kelp" build --workspace 2>"$tmp/cycle-error"; then
 fi
 grep -q 'cyclic dependency' "$tmp/cycle-error"
 cd "$tmp"
+
+# Workspace members share one Git dependency cache: the dependency is fetched
+# once at the workspace root instead of once per member.
+mkdir -p shared/a/src shared/b/src
+cat > shared/kelp.toml <<'EOF'
+[workspace]
+members = ["a", "b"]
+EOF
+for member in a b; do
+  cat > "shared/$member/kelp.toml" <<EOF
+[project]
+name = "$member"
+entry = "src/main.kly"
+
+[build]
+compiler = "$fake"
+
+[dependencies.demo]
+repository = "$tmp/dependency"
+revision = "$revision"
+EOF
+  printf 'pub fn main() -> i32 { return 0; }\n' > "shared/$member/src/main.kly"
+done
+cd shared
+"$kelp" build --workspace
+test -e .kelp/dependencies/demo
+test ! -e a/.kelp
+test ! -e b/.kelp
+# The cached dependency is reused by a later run without a second checkout.
+"$kelp" build --workspace
+cd "$tmp"
