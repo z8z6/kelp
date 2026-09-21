@@ -53,6 +53,12 @@ entry/output paths. Kelyra's `--progress` lists every loaded `.kly` module, C he
 C source, and the code-generation/link stages. These are phase counters, not
 time-based percentages; a failed build never reports successful completion.
 
+Every command reports wall-clock durations on stderr: a per-project
+`checked`/`built`/`tested`/`packaged` line, plus a workspace total when the
+selection covers more than one project. Durations use `s`/`ms` units and cover
+dependency resolution and compilation, so they are useful for spotting slow
+members and for CI trend tracking.
+
 ## Subprojects
 
 A `kelp.toml` may list subprojects under `[workspace] members`. Each member is a

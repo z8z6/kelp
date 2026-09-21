@@ -1,7 +1,9 @@
 #include <cctype>
 #include <cerrno>
 #include <charconv>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -375,6 +377,25 @@ Config LoadConfig(const fs::path &Root) {
     Result.Dependencies.push_back(std::move(Dependency));
   }
   return Result;
+}
+
+// Reports how long a command took, and formats it for the progress output.
+class Timer {
+  std::chrono::steady_clock::time_point Start =
+      std::chrono::steady_clock::now();
+
+public:
+  double Seconds() const {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                         Start)
+        .count();
+  }
+};
+
+std::string FormatDuration(double Seconds) {
+  char Buffer[32];
+  std::snprintf(Buffer, sizeof(Buffer), "%.3fs", Seconds);
+  return Buffer;
 }
 
 fs::path FindRoot() {
@@ -758,7 +779,13 @@ std::vector<std::string> CompilerCommand(const Config &Config,
 
 int Check(const fs::path &Root, const Config &Config) {
   const auto Prepared = Prepare(Root, Config);
-  return Execute(Root, CompilerCommand(Prepared.Project, "--check"));
+  Timer Timer;
+  const int Status =
+      Execute(Root, CompilerCommand(Prepared.Project, "--check"));
+  if (Status == 0)
+    std::cerr << "checked " << Config.Name << " in "
+              << FormatDuration(Timer.Seconds()) << '\n';
+  return Status;
 }
 
 int Build(const fs::path &Root, const Config &Config,
@@ -790,11 +817,14 @@ int Build(const fs::path &Root, const Config &Config,
     }
   std::cerr << "[2/3] Building " << Prepared.Project.Entry.string() << " -> "
             << Config.Output.string() << '\n';
+  Timer Timer;
   const int Status = Execute(Root, CompilerCommand(Prepared.Project, Action));
   if (Status == 0)
-    std::cerr << "[3/3] Finished " << Config.Output.string() << '\n';
+    std::cerr << "[3/3] Finished " << Config.Output.string() << " in "
+              << FormatDuration(Timer.Seconds()) << '\n';
   else
-    std::cerr << "Build failed (exit " << Status << ")\n";
+    std::cerr << "Build failed (exit " << Status << ") after "
+              << FormatDuration(Timer.Seconds()) << '\n';
   return Status;
 }
 
@@ -828,7 +858,12 @@ int Package(const fs::path &Root, const Config &Config,
                                      Config.Entry.parent_path().string()};
   if (fs::exists(Root / "README.md"))
     Arguments.push_back("README.md");
-  return Execute(Root, Arguments);
+  Timer Timer;
+  const int Status = Execute(Root, Arguments);
+  if (Status == 0)
+    std::cerr << "packaged " << Config.PackageOutput.string() << " in "
+              << FormatDuration(Timer.Seconds()) << '\n';
+  return Status;
 }
 
 bool ValidName(std::string_view Name) {
@@ -956,21 +991,31 @@ int main(int Argc, char **Argv) {
     const auto Nodes = LoadWorkspace(Root);
     if (Command == "check") {
       const auto Options = ParseCommandOptions(Argc, Argv, false);
-      for (const auto *Node : SelectTargets(Nodes, Options, false))
+      const auto Targets = SelectTargets(Nodes, Options, false);
+      Timer Total;
+      for (const auto *Node : Targets)
         if (const int Status = Check(Node->Root, Node->Project))
           return Status;
+      if (Targets.size() > 1)
+        std::cerr << "checked " << Targets.size() << " projects in "
+                  << FormatDuration(Total.Seconds()) << '\n';
       return 0;
     }
     if (Command == "build") {
       const auto Options = ParseCommandOptions(Argc, Argv, true);
+      const auto Targets = SelectTargets(Nodes, Options, false);
       std::set<std::string> Built;
-      for (const auto *Node : SelectTargets(Nodes, Options, false)) {
+      Timer Total;
+      for (const auto *Node : Targets) {
         auto Project = Node->Project;
         if (Options.Debug)
           Project.Optimization = 0;
         if (const int Status = Build(Node->Root, Project, Built))
           return Status;
       }
+      if (Targets.size() > 1)
+        std::cerr << "built " << Targets.size() << " projects in "
+                  << FormatDuration(Total.Seconds()) << '\n';
       return 0;
     }
     if (Command == "output") {
@@ -1005,29 +1050,42 @@ int main(int Argc, char **Argv) {
     }
     if (Command == "test") {
       const auto Options = ParseCommandOptions(Argc, Argv, false);
-      for (const auto *Node : SelectTargets(Nodes, Options, false)) {
+      const auto Targets = SelectTargets(Nodes, Options, false);
+      Timer Total;
+      for (const auto *Node : Targets) {
+        Timer Target;
         const auto Prepared = Prepare(Node->Root, Node->Project);
         if (Prepared.Project.TestSources.empty()) {
           if (const int Status = Execute(
                   Node->Root, CompilerCommand(Prepared.Project, "--check")))
             return Status;
-          continue;
+        } else {
+          for (const auto &Source : Prepared.Project.TestSources) {
+            auto Arguments = CompilerCommand(Prepared.Project, "--check");
+            Arguments.back() = Source;
+            if (const int Status = Execute(Node->Root, Arguments))
+              return Status;
+          }
         }
-        for (const auto &Source : Prepared.Project.TestSources) {
-          auto Arguments = CompilerCommand(Prepared.Project, "--check");
-          Arguments.back() = Source;
-          if (const int Status = Execute(Node->Root, Arguments))
-            return Status;
-        }
+        std::cerr << "tested " << Node->Project.Name << " in "
+                  << FormatDuration(Target.Seconds()) << '\n';
       }
+      if (Targets.size() > 1)
+        std::cerr << "tested " << Targets.size() << " projects in "
+                  << FormatDuration(Total.Seconds()) << '\n';
       return 0;
     }
     if (Command == "package") {
       const auto Options = ParseCommandOptions(Argc, Argv, false);
+      const auto Targets = SelectTargets(Nodes, Options, false);
       std::set<std::string> Built;
-      for (const auto *Node : SelectTargets(Nodes, Options, false))
+      Timer Total;
+      for (const auto *Node : Targets)
         if (const int Status = Package(Node->Root, Node->Project, Built))
           return Status;
+      if (Targets.size() > 1)
+        std::cerr << "packaged " << Targets.size() << " projects in "
+                  << FormatDuration(Total.Seconds()) << '\n';
       return 0;
     }
     throw std::runtime_error("unknown command '" + Command + "'");

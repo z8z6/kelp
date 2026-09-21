@@ -207,6 +207,23 @@ test ! -e app/.kelp
 "$kelp" package --workspace
 test -f libs/math/build/math.o
 test -f app/build/app-0.1.0.tar.gz
+
+# Commands report wall-clock durations on stderr. A multi-project selection adds
+# a total line; a single project reports only its own duration.
+duration='[0-9]+\.[0-9]{3}s'
+timing=$("$kelp" check --workspace 2>&1 >/dev/null)
+echo "$timing" | grep -Eq "^checked (math|app) in $duration$"
+echo "$timing" | grep -Eq "^checked 2 projects in $duration$"
+echo "$("$kelp" build --workspace 2>&1 >/dev/null)" |
+  grep -Eq "^built 2 projects in $duration$"
+echo "$("$kelp" test --workspace 2>&1 >/dev/null)" |
+  grep -Eq "^tested 2 projects in $duration$"
+echo "$("$kelp" package --workspace 2>&1 >/dev/null)" |
+  grep -Eq "^packaged 2 projects in $duration$"
+if "$kelp" check math 2>&1 >/dev/null | grep -q 'projects in'; then
+  echo "a single-project check reported a workspace total" >&2
+  exit 1
+fi
 cd "$tmp"
 
 # A project may be both a project and a workspace: the default builds only the
