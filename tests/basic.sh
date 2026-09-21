@@ -373,3 +373,39 @@ cd toolchain
 test -f .kelp/build/lib/lib.o
 test -x .kelp/build/app/app
 cd "$tmp"
+
+# A path dependency outside the workspace keeps a distinct subtree instead of
+# colliding with a same-named directory inside it.
+mkdir -p ext/ws/app/src ext/lib/src
+cat > ext/ws/kelp.toml <<'EOF'
+[workspace]
+members = ["app"]
+EOF
+cat > ext/lib/kelp.toml <<EOF
+[project]
+name = "lib"
+entry = "src/lib.kly"
+
+[build]
+compiler = "$fake"
+kind = "library"
+EOF
+printf 'pub fn value() -> i32 { return 0; }\n' > ext/lib/src/lib.kly
+cat > ext/ws/app/kelp.toml <<EOF
+[project]
+name = "app"
+entry = "src/main.kly"
+
+[build]
+compiler = "$fake"
+
+[dependencies.lib]
+path = "../../lib"
+EOF
+printf 'pub fn main() -> i32 { return 0; }\n' > ext/ws/app/src/main.kly
+cd ext/ws
+"$kelp" build
+test -f .kelp/build/__external/lib/lib.o
+test -x .kelp/build/app/app
+test ! -e ../lib/.kelp
+cd "$tmp"

@@ -435,7 +435,9 @@ fs::path FindWorkspaceRoot(const fs::path &Root) {
 // Every project builds into the workspace cache instead of a `build` directory
 // of its own. Each project keeps a subtree that mirrors where it sits, so
 // `libs/math` builds into `.kelp/build/libs/math`. A project outside the
-// workspace, such as a path dependency next door, uses its directory name.
+// workspace, such as a path dependency next door, marks each step out of the
+// tree with `__external`, so `../lib` becomes `.kelp/build/__external/lib`
+// rather than colliding with a same-named directory inside the workspace.
 fs::path BuildDirectory(const fs::path &Root, const fs::path &CacheRoot) {
   const auto Base = (CacheRoot.empty() ? Root : CacheRoot) / ".kelp/build";
   if (CacheRoot.empty())
@@ -444,9 +446,14 @@ fs::path BuildDirectory(const fs::path &Root, const fs::path &CacheRoot) {
   const auto Relative = fs::relative(Root, CacheRoot, Error);
   if (Error || Relative.empty() || Relative == ".")
     return Base.lexically_normal();
-  if (Relative.begin() != Relative.end() && *Relative.begin() == "..")
-    return (Base / Root.filename()).lexically_normal();
-  return (Base / Relative).lexically_normal();
+  fs::path Result;
+  for (const auto &Part : Relative) {
+    if (Part == "..")
+      Result /= "__external";
+    else if (Part != ".")
+      Result /= Part;
+  }
+  return (Base / Result).lexically_normal();
 }
 
 // A declared output is relative to the project's build directory. Manifests
