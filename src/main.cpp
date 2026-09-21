@@ -673,10 +673,23 @@ struct PreparedProject {
   std::vector<ResolvedDependency> Dependencies;
 };
 
+// A compiler path with a separator is resolved against the project root, so the
+// same absolute toolchain can build a dependency from a different directory. A
+// bare name is left to PATH lookup.
+std::string ResolveCompiler(const fs::path &Root, const std::string &Compiler) {
+  if (Compiler.find('/') == std::string::npos)
+    return Compiler;
+  const fs::path Path(Compiler);
+  if (Path.is_absolute())
+    return Path.lexically_normal().string();
+  return fs::absolute(Root / Path).lexically_normal().string();
+}
+
 PreparedProject Prepare(const fs::path &Root, const Config &Project) {
   PreparedProject Prepared;
   Config &Result = Prepared.Project;
   Result = Project;
+  Result.Compiler = ResolveCompiler(Root, Result.Compiler);
   // Sources are compiled where they live. Instead of copying the project and
   // dependency sources into a staging tree, every source directory is passed
   // to the compiler as a module search path.
@@ -765,10 +778,16 @@ int Build(const fs::path &Root, const Config &Config,
                              Error.message());
   const auto Prepared = Prepare(Root, Config);
   // A linked library must exist before the project that links it is compiled.
+  // It builds with the consumer's toolchain and shares its dependency cache, so
+  // a relative compiler path in the dependency still resolves.
   for (const auto &Dependency : Prepared.Dependencies)
-    if (Dependency.Project.Kind == BuildKind::Library)
-      if (const int Status = Build(Dependency.Root, Dependency.Project, Built))
+    if (Dependency.Project.Kind == BuildKind::Library) {
+      auto LibraryProject = Dependency.Project;
+      LibraryProject.Compiler = Prepared.Project.Compiler;
+      LibraryProject.CacheRoot = Config.CacheRoot;
+      if (const int Status = Build(Dependency.Root, LibraryProject, Built))
         return Status;
+    }
   std::cerr << "[2/3] Building " << Prepared.Project.Entry.string() << " -> "
             << Config.Output.string() << '\n';
   const int Status = Execute(Root, CompilerCommand(Prepared.Project, Action));

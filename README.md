@@ -96,7 +96,9 @@ source directory to Kelyra as an `--external-path` (so the consumer emits only
 declarations for its modules) and passes the object as a `--link-input`. The
 library's configured C sources are still linked into the final executable. That
 is how subprojects reference each other: put the shared code in a `library`
-project and depend on it; executable-kind dependencies stay source-level.
+project and depend on it; executable-kind dependencies stay source-level. A
+library dependency builds with the consumer's compiler and shares its
+dependency cache.
 
 ## Dependencies
 
