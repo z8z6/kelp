@@ -187,13 +187,18 @@ if "$kelp" run math >/dev/null 2>&1; then
 fi
 
 # The path dependency is used in place: its source directory becomes a module
-# search path and its C sources are linked, without a dependency cache.
+# search path and its C sources are linked, without a dependency cache. Because
+# it is a library, the consumer only declares its modules and links its object.
 export FAKE_KELYRA_LOG=$tmp/workspace-arguments
 rm -rf app/build
 "$kelp" build app
 grep -qx -- 'src/main.kly' "$FAKE_KELYRA_LOG"
 grep -qx -- "--module-path=$tmp/workspace/libs/math/src" "$FAKE_KELYRA_LOG"
+grep -qx -- "--external-path=$tmp/workspace/libs/math/src" "$FAKE_KELYRA_LOG"
+grep -qx -- "--link-input=$tmp/workspace/libs/math/build/math.o" \
+  "$FAKE_KELYRA_LOG"
 grep -q -- "--c-source=src/runtime.c" "$FAKE_KELYRA_LOG"
+test -f libs/math/build/math.o
 test ! -e app/.kelp
 
 # check, test, and package accept --workspace.

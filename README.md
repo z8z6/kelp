@@ -90,10 +90,13 @@ artifact path.
 - `library` compiles the project to an object file (default `build/<name>.o`)
   and rejects `kelp run`.
 
-Kelyra compiles every imported module into the program being built, so it has no
-separate compilation yet. A library is therefore consumed as source: a project
-that depends on it compiles its modules and C sources itself, and the library's
-own object is a standalone build artifact rather than a link input.
+A library is compiled once and linked, not copied into every consumer. When a
+project depends on a library, Kelp builds that library's object, passes its
+source directory to Kelyra as an `--external-path` (so the consumer emits only
+declarations for its modules) and passes the object as a `--link-input`. The
+library's configured C sources are still linked into the final executable. That
+is how subprojects reference each other: put the shared code in a `library`
+project and depend on it; executable-kind dependencies stay source-level.
 
 ## Dependencies
 

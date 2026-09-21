@@ -48,6 +48,8 @@ struct Config {
   std::vector<std::string> CSources;
   std::vector<std::string> CArguments;
   std::vector<std::string> ModulePaths;
+  std::vector<std::string> ExternalPaths;
+  std::vector<std::string> LinkInputs;
   std::vector<std::string> TestSources;
   std::vector<fs::path> WorkspaceMembers;
   // Git dependency cache shared by a workspace; empty for a standalone project.
@@ -666,8 +668,15 @@ std::vector<ResolvedDependency> ResolveDependencies(const fs::path &CacheRoot,
   return Result;
 }
 
-Config Prepare(const fs::path &Root, const Config &Project) {
-  Config Result = Project;
+struct PreparedProject {
+  Config Project;
+  std::vector<ResolvedDependency> Dependencies;
+};
+
+PreparedProject Prepare(const fs::path &Root, const Config &Project) {
+  PreparedProject Prepared;
+  Config &Result = Prepared.Project;
+  Result = Project;
   // Sources are compiled where they live. Instead of copying the project and
   // dependency sources into a staging tree, every source directory is passed
   // to the compiler as a module search path.
@@ -679,22 +688,31 @@ Config Prepare(const fs::path &Root, const Config &Project) {
   std::error_code Error;
   fs::remove_all(Root / ".kelp/stage", Error);
   if (Project.Dependencies.empty())
-    return Result;
+    return Prepared;
   const auto CacheRoot = Project.CacheRoot.empty() ? Root : Project.CacheRoot;
   for (const auto &Dependency : ResolveDependencies(CacheRoot, Root, Project)) {
     const auto DependencySourceRoot = Dependency.Project.Entry.parent_path();
-    Result.ModulePaths.push_back(
-        fs::absolute(Dependency.Root / DependencySourceRoot)
-            .lexically_normal()
-            .string());
+    const auto AbsoluteSourceRoot =
+        fs::absolute(Dependency.Root / DependencySourceRoot).lexically_normal();
+    Result.ModulePaths.push_back(AbsoluteSourceRoot.string());
     for (const auto &Source : Dependency.Project.CSources)
       Result.CSources.push_back(
           fs::absolute(Dependency.Root / Source).string());
     Result.CArguments.insert(Result.CArguments.end(),
                              Dependency.Project.CArguments.begin(),
                              Dependency.Project.CArguments.end());
+    if (Dependency.Project.Kind == BuildKind::Library) {
+      // A library dependency is compiled once into its own object: consumers
+      // only declare its modules and link the object.
+      Result.ExternalPaths.push_back(AbsoluteSourceRoot.string());
+      Result.LinkInputs.push_back(
+          fs::absolute(Dependency.Root / Dependency.Project.Output)
+              .lexically_normal()
+              .string());
+    }
+    Prepared.Dependencies.push_back(Dependency);
   }
-  return Result;
+  return Prepared;
 }
 
 std::vector<std::string> CompilerCommand(const Config &Config,
@@ -702,15 +720,20 @@ std::vector<std::string> CompilerCommand(const Config &Config,
   std::vector<std::string> Result{Config.Compiler, std::move(Action)};
   for (const auto &Path : Config.ModulePaths)
     Result.push_back("--module-path=" + Path);
+  for (const auto &Path : Config.ExternalPaths)
+    Result.push_back("--external-path=" + Path);
   const bool ProducesArtifact =
       Result[1] == "--emit-exe" || Result[1] == "--emit-obj";
   if (ProducesArtifact) {
     Result.push_back("--progress");
     Result.push_back("-O" + std::to_string(Config.Optimization));
     Result.push_back("--safe-level=" + std::to_string(Config.SafeLevel));
-    if (Result[1] == "--emit-exe")
+    if (Result[1] == "--emit-exe") {
       for (const auto &Source : Config.CSources)
         Result.push_back("--c-source=" + Source);
+      for (const auto &Input : Config.LinkInputs)
+        Result.push_back("--link-input=" + Input);
+    }
     for (const auto &Argument : Config.CArguments)
       Result.push_back("--c-arg=" + Argument);
     Result.push_back("-o");
@@ -722,12 +745,16 @@ std::vector<std::string> CompilerCommand(const Config &Config,
 
 int Check(const fs::path &Root, const Config &Config) {
   const auto Prepared = Prepare(Root, Config);
-  return Execute(Root, CompilerCommand(Prepared, "--check"));
+  return Execute(Root, CompilerCommand(Prepared.Project, "--check"));
 }
 
-int Build(const fs::path &Root, const Config &Config) {
+int Build(const fs::path &Root, const Config &Config,
+          std::set<std::string> &Built) {
   if (!Config.HasProject)
     throw std::runtime_error("workspace root has no buildable project");
+  const auto Key = fs::weakly_canonical(Root).string();
+  if (!Built.insert(Key).second)
+    return 0;
   const std::string Action =
       Config.Kind == BuildKind::Library ? "--emit-obj" : "--emit-exe";
   std::cerr << "[1/3] Preparing " << Config.Name << '\n';
@@ -737,14 +764,24 @@ int Build(const fs::path &Root, const Config &Config) {
     throw std::runtime_error("cannot create build directory: " +
                              Error.message());
   const auto Prepared = Prepare(Root, Config);
-  std::cerr << "[2/3] Building " << Prepared.Entry.string() << " -> "
+  // A linked library must exist before the project that links it is compiled.
+  for (const auto &Dependency : Prepared.Dependencies)
+    if (Dependency.Project.Kind == BuildKind::Library)
+      if (const int Status = Build(Dependency.Root, Dependency.Project, Built))
+        return Status;
+  std::cerr << "[2/3] Building " << Prepared.Project.Entry.string() << " -> "
             << Config.Output.string() << '\n';
-  const int Status = Execute(Root, CompilerCommand(Prepared, Action));
+  const int Status = Execute(Root, CompilerCommand(Prepared.Project, Action));
   if (Status == 0)
     std::cerr << "[3/3] Finished " << Config.Output.string() << '\n';
   else
     std::cerr << "Build failed (exit " << Status << ")\n";
   return Status;
+}
+
+int Build(const fs::path &Root, const Config &Config) {
+  std::set<std::string> Built;
+  return Build(Root, Config, Built);
 }
 
 int RunProject(const ProjectNode &Node,
@@ -758,8 +795,9 @@ int RunProject(const ProjectNode &Node,
   return Execute(Node.Root, Command);
 }
 
-int Package(const fs::path &Root, const Config &Config) {
-  if (const int Status = Build(Root, Config))
+int Package(const fs::path &Root, const Config &Config,
+            std::set<std::string> &Built) {
+  if (const int Status = Build(Root, Config, Built))
     return Status;
   std::error_code Error;
   fs::create_directories(Root / Config.PackageOutput.parent_path(), Error);
@@ -906,11 +944,12 @@ int main(int Argc, char **Argv) {
     }
     if (Command == "build") {
       const auto Options = ParseCommandOptions(Argc, Argv, true);
+      std::set<std::string> Built;
       for (const auto *Node : SelectTargets(Nodes, Options, false)) {
         auto Project = Node->Project;
         if (Options.Debug)
           Project.Optimization = 0;
-        if (const int Status = Build(Node->Root, Project))
+        if (const int Status = Build(Node->Root, Project, Built))
           return Status;
       }
       return 0;
@@ -949,14 +988,14 @@ int main(int Argc, char **Argv) {
       const auto Options = ParseCommandOptions(Argc, Argv, false);
       for (const auto *Node : SelectTargets(Nodes, Options, false)) {
         const auto Prepared = Prepare(Node->Root, Node->Project);
-        if (Prepared.TestSources.empty()) {
-          if (const int Status =
-                  Execute(Node->Root, CompilerCommand(Prepared, "--check")))
+        if (Prepared.Project.TestSources.empty()) {
+          if (const int Status = Execute(
+                  Node->Root, CompilerCommand(Prepared.Project, "--check")))
             return Status;
           continue;
         }
-        for (const auto &Source : Prepared.TestSources) {
-          auto Arguments = CompilerCommand(Prepared, "--check");
+        for (const auto &Source : Prepared.Project.TestSources) {
+          auto Arguments = CompilerCommand(Prepared.Project, "--check");
           Arguments.back() = Source;
           if (const int Status = Execute(Node->Root, Arguments))
             return Status;
@@ -966,8 +1005,9 @@ int main(int Argc, char **Argv) {
     }
     if (Command == "package") {
       const auto Options = ParseCommandOptions(Argc, Argv, false);
+      std::set<std::string> Built;
       for (const auto *Node : SelectTargets(Nodes, Options, false))
-        if (const int Status = Package(Node->Root, Node->Project))
+        if (const int Status = Package(Node->Root, Node->Project, Built))
           return Status;
       return 0;
     }
