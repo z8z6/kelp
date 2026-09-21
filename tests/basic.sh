@@ -312,3 +312,39 @@ test ! -e b/.kelp
 (cd a && "$kelp" build)
 test ! -e a/.kelp
 cd "$tmp"
+
+# A library dependency is built with the consumer's compiler, resolved against
+# the consumer root, so a relative path or a stale dependency manifest works.
+mkdir -p toolchain/lib/src toolchain/app/src
+cp "$fake" toolchain/toolchain
+cat > toolchain/kelp.toml <<'EOF'
+[workspace]
+members = ["lib", "app"]
+EOF
+cat > toolchain/lib/kelp.toml <<'EOF'
+[project]
+name = "lib"
+entry = "src/lib.kly"
+
+[build]
+compiler = "missing-compiler"
+kind = "library"
+EOF
+printf 'pub fn value() -> i32 { return 1; }\n' > toolchain/lib/src/lib.kly
+cat > toolchain/app/kelp.toml <<'EOF'
+[project]
+name = "app"
+entry = "src/main.kly"
+
+[build]
+compiler = "../toolchain"
+
+[dependencies.lib]
+path = "../lib"
+EOF
+printf 'pub fn main() -> i32 { return 0; }\n' > toolchain/app/src/main.kly
+cd toolchain
+"$kelp" build app
+test -f lib/build/lib.o
+test -x app/build/app
+cd "$tmp"
