@@ -125,3 +125,151 @@ grep -q -- "--c-source=$tmp/consumer/.kelp/dependencies/demo/src/demo/runtime.c"
 test -f build/consumer-0.1.0.tar.gz
 tar -tzf build/consumer-0.1.0.tar.gz | grep -q '^kelp.toml$'
 tar -tzf build/consumer-0.1.0.tar.gz | grep -q '^src/main.kly$'
+cd "$tmp"
+
+# A workspace nests subprojects, each with its own kelp.toml. A library project
+# builds an object artifact; an executable consumes a sibling through a local
+# path dependency, so nothing is cloned.
+mkdir -p workspace/libs/math/src workspace/app/src
+cat > workspace/kelp.toml <<'EOF'
+[workspace]
+members = ["libs/math", "app"]
+EOF
+cat > workspace/libs/math/kelp.toml <<EOF
+[project]
+name = "math"
+entry = "src/math.kly"
+
+[build]
+compiler = "$fake"
+kind = "library"
+EOF
+cat > workspace/libs/math/src/math.kly <<'EOF'
+pub fn answer() -> i32 { return 0; }
+EOF
+cat > workspace/app/kelp.toml <<EOF
+[project]
+name = "app"
+entry = "src/main.kly"
+
+[build]
+compiler = "$fake"
+c-sources = ["src/runtime.c"]
+
+[dependencies.math]
+path = "../libs/math"
+EOF
+printf 'pub fn main() -> i32 { return 0; }\n' > workspace/app/src/main.kly
+printf 'int app_runtime(void) { return 0; }\n' > workspace/app/src/runtime.c
+
+cd workspace
+"$kelp" members | grep -qx 'libs/math math library build/math.o'
+"$kelp" members | grep -qx 'app app executable build/app'
+"$kelp" members | grep -qx '. - workspace -'
+
+# A workspace root without [project] builds every member by default.
+"$kelp" build
+test -f libs/math/build/math.o
+test -x app/build/app
+
+# A selector builds or queries only that member.
+rm -f libs/math/build/math.o
+"$kelp" build math
+test -f libs/math/build/math.o
+test "$("$kelp" output app)" = "$tmp/workspace/app/build/app"
+if "$kelp" build missing >/dev/null 2>&1; then
+  echo "unknown workspace member was accepted" >&2
+  exit 1
+fi
+if "$kelp" run math >/dev/null 2>&1; then
+  echo "library project was run" >&2
+  exit 1
+fi
+
+# The path dependency is used in place: its source directory becomes a module
+# search path and its C sources are linked, without a dependency cache.
+export FAKE_KELYRA_LOG=$tmp/workspace-arguments
+rm -rf app/build
+"$kelp" build app
+grep -qx -- 'src/main.kly' "$FAKE_KELYRA_LOG"
+grep -qx -- "--module-path=$tmp/workspace/libs/math/src" "$FAKE_KELYRA_LOG"
+grep -q -- "--c-source=src/runtime.c" "$FAKE_KELYRA_LOG"
+test ! -e app/.kelp
+
+# check, test, and package accept --workspace.
+"$kelp" check --workspace
+"$kelp" test --workspace
+"$kelp" package --workspace
+test -f libs/math/build/math.o
+test -f app/build/app-0.1.0.tar.gz
+cd "$tmp"
+
+# A project may be both a project and a workspace: the default builds only the
+# root, and --workspace adds the members.
+mkdir -p combined/src combined/child/src
+cat > combined/kelp.toml <<EOF
+[project]
+name = "combined"
+entry = "src/main.kly"
+
+[build]
+compiler = "$fake"
+
+[workspace]
+members = ["child"]
+EOF
+cat > combined/child/kelp.toml <<EOF
+[project]
+name = "child"
+entry = "src/main.kly"
+
+[build]
+compiler = "$fake"
+EOF
+printf 'pub fn main() -> i32 { return 0; }\n' > combined/src/main.kly
+printf 'pub fn main() -> i32 { return 0; }\n' > combined/child/src/main.kly
+cd combined
+"$kelp" build
+test -x build/combined
+test ! -e child/build
+"$kelp" build --workspace
+test -x child/build/child
+cd "$tmp"
+
+# Path dependencies participate in cycle detection.
+mkdir -p cycle/a/src cycle/b/src
+cat > cycle/kelp.toml <<'EOF'
+[workspace]
+members = ["a", "b"]
+EOF
+cat > cycle/a/kelp.toml <<EOF
+[project]
+name = "a"
+entry = "src/main.kly"
+
+[build]
+compiler = "$fake"
+
+[dependencies.b]
+path = "../b"
+EOF
+cat > cycle/b/kelp.toml <<EOF
+[project]
+name = "b"
+entry = "src/main.kly"
+
+[build]
+compiler = "$fake"
+
+[dependencies.a]
+path = "../a"
+EOF
+printf 'pub fn main() -> i32 { return 0; }\n' > cycle/a/src/main.kly
+printf 'pub fn main() -> i32 { return 0; }\n' > cycle/b/src/main.kly
+cd cycle
+if "$kelp" build --workspace 2>"$tmp/cycle-error"; then
+  echo "cyclic path dependency was accepted" >&2
+  exit 1
+fi
+grep -q 'cyclic dependency' "$tmp/cycle-error"
+cd "$tmp"

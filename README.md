@@ -23,6 +23,7 @@ entry = "src/main.kly"
 
 [build]
 compiler = "kelyra"
+kind = "executable"
 output = "build/hello"
 optimization = 0
 safe-level = 0
@@ -40,26 +41,83 @@ repository = "git@github.com:z8z6/kstd.git"
 revision = "main"
 ```
 
-Supported commands are `new`, `init`, `check`, `build`, `output`, `run`, `test`, and
-`package`. `package` builds the project and creates the configured `.tar.gz`
-source archive.
+Supported commands are `new`, `init`, `members`, `check`, `build`, `output`,
+`run`, `test`, and `package`. `package` builds the project and creates the
+configured `.tar.gz` source archive.
 
 `build --debug` overrides optimization with `-O0` without changing `kelp.toml`.
-`output` prints the absolute configured executable path without building or
+`output` prints the absolute configured artifact path without building or
 fetching dependencies; editor integrations use it to configure a debugger.
 Builds report preparation, compilation, and completion on stderr, including the
 entry/output paths. Kelyra's `--progress` lists every loaded `.kly` module, C header,
 C source, and the code-generation/link stages. These are phase counters, not
 time-based percentages; a failed build never reports successful completion.
 
-Dependencies use Git repositories. Kelp clones them into
-`.kelp/dependencies`, checks out `revision` when provided, and passes each
+## Subprojects
+
+A `kelp.toml` may list subprojects under `[workspace] members`. Each member is a
+directory with its own `kelp.toml`, and members may nest recursively:
+
+```toml
+[workspace]
+members = ["libs/math", "apps/demo"]
+```
+
+A workspace root may also be a project itself. `kelp members` prints every
+project in the tree as `<path> <name> <kind> <output>`; a workspace root without
+its own `[project]` is listed with `-` for both name and output.
+
+Commands accept an optional `<member>` selector, matched by project name or by
+the member's path relative to the workspace root, and a `--workspace` flag:
+
+```sh
+kelp build                   # the current project, or every member of a pure workspace
+kelp build --workspace       # the current project and every member
+kelp build math              # only the member named math
+kelp output apps/demo        # by relative path
+kelp check --workspace
+kelp test --workspace
+kelp package --workspace
+```
+
+Members are visited before their parent so dependencies build first. `run`
+always targets a single executable project, and `output` always prints a single
+artifact path.
+
+`build.kind` selects what `kelp build` produces:
+
+- `executable` (default) links an executable at `build.output`;
+- `library` compiles the project to an object file (default `build/<name>.o`)
+  and rejects `kelp run`.
+
+Kelyra compiles every imported module into the program being built, so it has no
+separate compilation yet. A library is therefore consumed as source: a project
+that depends on it compiles its modules and C sources itself, and the library's
+own object is a standalone build artifact rather than a link input.
+
+## Dependencies
+
+Dependencies use Git repositories or local paths. Kelp clones Git dependencies
+into `.kelp/dependencies`, checks out `revision` when provided, and passes each
 dependency source directory to Kelyra as a `--module-path` search directory.
 Their configured C sources are compiled into the final executable. Sources are
 compiled where they live: Kelp never copies them into a staging tree, so
 diagnostics and debug information point at the real files. Modules in the
 project's own source directory take priority, followed by dependency
 directories in resolution order.
+
+A path dependency is used in place and is never cloned, which keeps a sibling
+checkout visible without a Git round trip:
+
+```toml
+[dependencies.math]
+path = "../libs/math"
+```
+
+The path is resolved relative to the manifest (absolute paths are allowed) and
+must contain a `kelp.toml`. Either `repository`/`revision` or `path` may be
+given for one dependency, never both. Path and Git dependencies may mix in one
+project, and both participate in cycle detection.
 
 Kelp searches parent directories for `kelp.toml`, so commands also work from a
 project subdirectory. The parser intentionally supports the TOML values used

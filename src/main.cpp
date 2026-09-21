@@ -24,13 +24,19 @@ namespace {
 using Value =
     std::variant<std::string, std::uint64_t, bool, std::vector<std::string>>;
 
+enum class BuildKind { Executable, Library };
+
 struct Config {
   struct Dependency {
     std::string Name;
     std::string Repository;
     std::string Revision;
+    fs::path Path;
+    bool Local = false;
   };
 
+  bool HasProject = false;
+  BuildKind Kind = BuildKind::Executable;
   std::string Name;
   std::string Version;
   fs::path Entry;
@@ -43,6 +49,7 @@ struct Config {
   std::vector<std::string> CArguments;
   std::vector<std::string> ModulePaths;
   std::vector<std::string> TestSources;
+  std::vector<fs::path> WorkspaceMembers;
   std::vector<Dependency> Dependencies;
 };
 
@@ -230,13 +237,22 @@ T Get(const std::map<std::string, Value> &Values, std::string_view Key,
   return *Result;
 }
 
+BuildKind ParseBuildKind(const std::string &Value) {
+  if (Value == "executable")
+    return BuildKind::Executable;
+  if (Value == "library")
+    return BuildKind::Library;
+  throw std::runtime_error("build.kind must be 'executable' or 'library'");
+}
+
 Config LoadConfig(const fs::path &Root) {
   const auto Values = ParseToml(Root / "kelp.toml");
   static const std::vector<std::string> Known{
-      "project.name",     "project.version", "project.entry",
-      "build.compiler",   "build.output",    "build.optimization",
-      "build.safe-level", "build.c-sources", "build.c-args",
-      "package.output",   "test.sources"};
+      "project.name",       "project.version",  "project.entry",
+      "build.compiler",     "build.kind",       "build.output",
+      "build.optimization", "build.safe-level", "build.c-sources",
+      "build.c-args",       "package.output",   "test.sources",
+      "workspace.members"};
   std::set<std::string> DependencyNames;
   for (const auto &[Key, Ignored] : Values) {
     (void)Ignored;
@@ -252,7 +268,8 @@ Config LoadConfig(const fs::path &Root) {
         throw std::runtime_error("invalid dependency key '" + Key + "'");
       const auto Name = Rest.substr(0, Dot);
       const auto Field = Rest.substr(Dot + 1);
-      if (!ValidName(Name) || (Field != "repository" && Field != "revision"))
+      if (!ValidName(Name) ||
+          (Field != "repository" && Field != "revision" && Field != "path"))
         throw std::runtime_error("invalid dependency key '" + Key + "'");
       DependencyNames.insert(Name);
       Found = true;
@@ -260,19 +277,22 @@ Config LoadConfig(const fs::path &Root) {
     if (!Found)
       throw std::runtime_error("unknown key '" + Key + "'");
   }
+
   Config Result;
-  Result.Name = Get<std::string>(Values, "project.name");
-  Result.Version =
-      Get<std::string>(Values, "project.version", std::string("0.1.0"));
-  Result.Entry =
-      Get<std::string>(Values, "project.entry", std::string("src/main.kly"));
-  Result.Compiler =
-      Get<std::string>(Values, "build.compiler", std::string("kelyra"));
-  Result.Output = Get<std::string>(Values, "build.output",
-                                   std::string("build/") + Result.Name);
-  Result.PackageOutput = Get<std::string>(Values, "package.output",
-                                          std::string("build/") + Result.Name +
-                                              "-" + Result.Version + ".tar.gz");
+  Result.HasProject = Values.count("project.name") != 0;
+  for (const auto &Member : Get<std::vector<std::string>>(
+           Values, "workspace.members", std::vector<std::string>{})) {
+    const fs::path MemberPath(Member);
+    if (!SafeRelativePath(MemberPath))
+      throw std::runtime_error(
+          "workspace.members must contain relative paths without '..'");
+    Result.WorkspaceMembers.push_back(MemberPath);
+  }
+  if (!Result.HasProject && Result.WorkspaceMembers.empty())
+    throw std::runtime_error(
+        "kelp.toml must define [project] or a non-empty [workspace] members");
+  Result.Kind = ParseBuildKind(
+      Get<std::string>(Values, "build.kind", std::string("executable")));
   const auto Optimization =
       Get<std::uint64_t>(Values, "build.optimization", std::uint64_t{0});
   const auto SafeLevel =
@@ -289,31 +309,67 @@ Config LoadConfig(const fs::path &Root) {
                                                     std::vector<std::string>{});
   Result.TestSources = Get<std::vector<std::string>>(
       Values, "test.sources", std::vector<std::string>{});
+
+  if (Result.HasProject) {
+    Result.Name = Get<std::string>(Values, "project.name");
+    Result.Version =
+        Get<std::string>(Values, "project.version", std::string("0.1.0"));
+    Result.Entry =
+        Get<std::string>(Values, "project.entry", std::string("src/main.kly"));
+    Result.Compiler =
+        Get<std::string>(Values, "build.compiler", std::string("kelyra"));
+    const auto DefaultOutput = Result.Kind == BuildKind::Library
+                                   ? std::string("build/") + Result.Name + ".o"
+                                   : std::string("build/") + Result.Name;
+    Result.Output = Get<std::string>(Values, "build.output", DefaultOutput);
+    Result.PackageOutput = Get<std::string>(
+        Values, "package.output",
+        std::string("build/") + Result.Name + "-" + Result.Version + ".tar.gz");
+    if (!ValidName(Result.Name))
+      throw std::runtime_error(
+          "project name must use letters, digits, '-' or '_'");
+    if (!SafeRelativePath(Result.Entry) || Result.Entry.parent_path().empty())
+      throw std::runtime_error(
+          "project.entry must be inside a source directory");
+    if (!SafeRelativePath(Result.Output) ||
+        !SafeRelativePath(Result.PackageOutput))
+      throw std::runtime_error(
+          "build and package outputs must be relative paths");
+    for (const auto &Source : Result.CSources)
+      if (!SafeRelativePath(Source))
+        throw std::runtime_error("build.c-sources must contain relative paths");
+    for (const auto &Source : Result.TestSources)
+      if (!SafeRelativePath(Source))
+        throw std::runtime_error("test.sources must contain relative paths");
+  }
+
   for (const auto &Name : DependencyNames) {
     Config::Dependency Dependency;
     Dependency.Name = Name;
-    Dependency.Repository =
-        Get<std::string>(Values, "dependencies." + Name + ".repository");
-    Dependency.Revision = Get<std::string>(
+    const auto Repository = Get<std::string>(
+        Values, "dependencies." + Name + ".repository", std::string{});
+    const auto Revision = Get<std::string>(
         Values, "dependencies." + Name + ".revision", std::string{});
-    if (Dependency.Repository.empty() || Dependency.Repository.front() == '-' ||
-        (!Dependency.Revision.empty() && Dependency.Revision.front() == '-'))
-      throw std::runtime_error(
-          "invalid dependency repository or revision for '" + Name + "'");
+    const auto Path = Get<std::string>(Values, "dependencies." + Name + ".path",
+                                       std::string{});
+    if (!Path.empty()) {
+      if (!Repository.empty() || !Revision.empty())
+        throw std::runtime_error("dependency '" + Name +
+                                 "' must use either repository or path");
+      if (Path.front() == '-')
+        throw std::runtime_error("invalid dependency path for '" + Name + "'");
+      Dependency.Local = true;
+      Dependency.Path = Path;
+    } else {
+      if (Repository.empty() || Repository.front() == '-' ||
+          (!Revision.empty() && Revision.front() == '-'))
+        throw std::runtime_error(
+            "invalid dependency repository or revision for '" + Name + "'");
+      Dependency.Repository = Repository;
+      Dependency.Revision = Revision;
+    }
     Result.Dependencies.push_back(std::move(Dependency));
   }
-  if (!SafeRelativePath(Result.Entry) || Result.Entry.parent_path().empty())
-    throw std::runtime_error("project.entry must be inside a source directory");
-  if (!SafeRelativePath(Result.Output) ||
-      !SafeRelativePath(Result.PackageOutput))
-    throw std::runtime_error(
-        "build and package outputs must be relative paths");
-  for (const auto &Source : Result.CSources)
-    if (!SafeRelativePath(Source))
-      throw std::runtime_error("build.c-sources must contain relative paths");
-  for (const auto &Source : Result.TestSources)
-    if (!SafeRelativePath(Source))
-      throw std::runtime_error("test.sources must contain relative paths");
   return Result;
 }
 
@@ -326,6 +382,123 @@ fs::path FindRoot() {
       throw std::runtime_error("could not find kelp.toml");
     Current = Current.parent_path();
   }
+}
+
+struct ProjectNode {
+  fs::path Root;
+  Config Project;
+};
+
+void LoadWorkspace(const fs::path &Root, std::vector<ProjectNode> &Nodes,
+                   std::set<std::string> &Seen) {
+  const auto Key = fs::weakly_canonical(Root).string();
+  if (!Seen.insert(Key).second)
+    throw std::runtime_error("duplicate workspace member: " + Root.string());
+  auto Project = LoadConfig(Root);
+  for (const auto &Member : Project.WorkspaceMembers) {
+    const auto MemberRoot = (Root / Member).lexically_normal();
+    if (!fs::exists(MemberRoot / "kelp.toml"))
+      throw std::runtime_error("workspace member '" + Member.string() +
+                               "' has no kelp.toml");
+    LoadWorkspace(MemberRoot, Nodes, Seen);
+  }
+  // Members are visited before their parent so builds run dependencies first.
+  Nodes.push_back({Root, std::move(Project)});
+}
+
+std::vector<ProjectNode> LoadWorkspace(const fs::path &Root) {
+  std::vector<ProjectNode> Nodes;
+  std::set<std::string> Seen;
+  LoadWorkspace(Root, Nodes, Seen);
+  return Nodes;
+}
+
+std::string ProjectKindName(const Config &Project) {
+  if (!Project.HasProject)
+    return "workspace";
+  return Project.Kind == BuildKind::Library ? "library" : "executable";
+}
+
+std::string RelativeNodePath(const fs::path &Root,
+                             const fs::path &WorkspaceRoot) {
+  std::error_code Error;
+  const auto Relative = fs::relative(Root, WorkspaceRoot, Error);
+  if (Error || Relative.empty())
+    return ".";
+  return Relative.generic_string();
+}
+
+bool MatchesSelector(const ProjectNode &Node, const fs::path &WorkspaceRoot,
+                     const std::string &Selector) {
+  if (Node.Project.HasProject && Node.Project.Name == Selector)
+    return true;
+  return RelativeNodePath(Node.Root, WorkspaceRoot) == Selector;
+}
+
+struct CommandOptions {
+  std::optional<std::string> Selector;
+  bool Workspace = false;
+  bool Debug = false;
+};
+
+CommandOptions ParseCommandOptions(int Argc, char **Argv, bool AllowDebug) {
+  CommandOptions Options;
+  for (int I = 2; I < Argc; ++I) {
+    const std::string_view Argument = Argv[I];
+    if (Argument == "--workspace" || Argument == "--all" || Argument == "-w")
+      Options.Workspace = true;
+    else if (AllowDebug && Argument == "--debug")
+      Options.Debug = true;
+    else if (!Argument.empty() && Argument.front() == '-')
+      throw std::runtime_error("unknown option '" + std::string(Argument) +
+                               "'");
+    else if (Options.Selector)
+      throw std::runtime_error("unexpected argument '" + std::string(Argument) +
+                               "'");
+    else
+      Options.Selector = std::string(Argument);
+  }
+  return Options;
+}
+
+std::vector<const ProjectNode *>
+SelectTargets(const std::vector<ProjectNode> &Nodes,
+              const CommandOptions &Options, bool RequireSingle) {
+  std::vector<const ProjectNode *> Targets;
+  if (Options.Selector) {
+    const ProjectNode *Match = nullptr;
+    for (const auto &Node : Nodes)
+      if (MatchesSelector(Node, Nodes.back().Root, *Options.Selector)) {
+        if (Match)
+          throw std::runtime_error("ambiguous workspace member '" +
+                                   *Options.Selector + "'");
+        Match = &Node;
+      }
+    if (!Match)
+      throw std::runtime_error("unknown workspace member '" +
+                               *Options.Selector + "'");
+    if (!Match->Project.HasProject)
+      throw std::runtime_error("workspace member '" + *Options.Selector +
+                               "' is not a project");
+    Targets.push_back(Match);
+  } else if (Options.Workspace) {
+    for (const auto &Node : Nodes)
+      if (Node.Project.HasProject)
+        Targets.push_back(&Node);
+  } else {
+    const auto &RootNode = Nodes.back();
+    if (RootNode.Project.HasProject)
+      Targets.push_back(&RootNode);
+    else
+      for (const auto &Node : Nodes)
+        if (Node.Project.HasProject)
+          Targets.push_back(&Node);
+  }
+  if (Targets.empty())
+    throw std::runtime_error("no buildable project found");
+  if (RequireSingle && Targets.size() != 1)
+    throw std::runtime_error("select one project with a member name");
+  return Targets;
 }
 
 int Execute(const fs::path &Root, const std::vector<std::string> &Arguments) {
@@ -364,54 +537,73 @@ struct ResolvedDependency {
   Config Project;
 };
 
-void ResolveDependencies(const fs::path &ProjectRoot, const Config &Project,
+void ResolveDependencies(const fs::path &CacheRoot, const fs::path &ProjectRoot,
+                         const Config &Project,
                          std::vector<ResolvedDependency> &Result,
                          std::set<std::string> &Resolving,
                          std::set<std::string> &Resolved) {
-  const auto Cache = ProjectRoot / ".kelp/dependencies";
-  fs::create_directories(Cache);
   for (const auto &Dependency : Project.Dependencies) {
-    if (Resolved.count(Dependency.Name))
+    fs::path DependencyRoot;
+    if (Dependency.Local) {
+      DependencyRoot = Dependency.Path.is_absolute()
+                           ? Dependency.Path
+                           : ProjectRoot / Dependency.Path;
+      DependencyRoot = DependencyRoot.lexically_normal();
+      if (!fs::exists(DependencyRoot / "kelp.toml"))
+        throw std::runtime_error(
+            "path dependency '" + Dependency.Name +
+            "' is not a Kelp project: " + DependencyRoot.string());
+    } else {
+      const auto Cache = CacheRoot / ".kelp/dependencies";
+      fs::create_directories(Cache);
+      DependencyRoot = Cache / Dependency.Name;
+    }
+    const auto Key = fs::weakly_canonical(DependencyRoot).string();
+    if (Resolved.count(Key))
       continue;
-    if (!Resolving.insert(Dependency.Name).second)
+    if (!Resolving.insert(Key).second)
       throw std::runtime_error("cyclic dependency involving '" +
                                Dependency.Name + "'");
-    const auto DependencyRoot = Cache / Dependency.Name;
-    if (!fs::exists(DependencyRoot)) {
-      std::cout << "fetching " << Dependency.Name << " from "
-                << Dependency.Repository << '\n';
-      if (const int Status = Execute(ProjectRoot, {"git", "clone", "--quiet",
-                                                   "--", Dependency.Repository,
-                                                   DependencyRoot.string()}))
-        throw std::runtime_error("git clone failed with status " +
+    if (!Dependency.Local) {
+      if (!fs::exists(DependencyRoot)) {
+        std::cout << "fetching " << Dependency.Name << " from "
+                  << Dependency.Repository << '\n';
+        if (const int Status = Execute(
+                ProjectRoot, {"git", "clone", "--quiet", "--",
+                              Dependency.Repository, DependencyRoot.string()}))
+          throw std::runtime_error("git clone failed with status " +
+                                   std::to_string(Status));
+      } else if (!fs::exists(DependencyRoot / ".git")) {
+        throw std::runtime_error("dependency cache is not a Git repository: " +
+                                 DependencyRoot.string());
+      } else if (const int Status = Execute(
+                     DependencyRoot, {"git", "remote", "set-url", "origin",
+                                      Dependency.Repository})) {
+        throw std::runtime_error("cannot update dependency remote, status " +
                                  std::to_string(Status));
-    } else if (!fs::exists(DependencyRoot / ".git")) {
-      throw std::runtime_error("dependency cache is not a Git repository: " +
-                               DependencyRoot.string());
-    } else if (const int Status =
-                   Execute(DependencyRoot, {"git", "remote", "set-url",
-                                            "origin", Dependency.Repository})) {
-      throw std::runtime_error("cannot update dependency remote, status " +
-                               std::to_string(Status));
-    }
-    if (!Dependency.Revision.empty()) {
-      if (const int Status =
-              Execute(DependencyRoot, {"git", "fetch", "--quiet", "origin",
-                                       Dependency.Revision}))
-        throw std::runtime_error("git fetch failed with status " +
-                                 std::to_string(Status));
-      if (const int Status =
-              Execute(DependencyRoot,
-                      {"git", "checkout", "--quiet", "--detach", "FETCH_HEAD"}))
-        throw std::runtime_error("git checkout failed with status " +
-                                 std::to_string(Status));
+      }
+      if (!Dependency.Revision.empty()) {
+        if (const int Status =
+                Execute(DependencyRoot, {"git", "fetch", "--quiet", "origin",
+                                         Dependency.Revision}))
+          throw std::runtime_error("git fetch failed with status " +
+                                   std::to_string(Status));
+        if (const int Status =
+                Execute(DependencyRoot, {"git", "checkout", "--quiet",
+                                         "--detach", "FETCH_HEAD"}))
+          throw std::runtime_error("git checkout failed with status " +
+                                   std::to_string(Status));
+      }
     }
     auto DependencyProject = LoadConfig(DependencyRoot);
-    ResolveDependencies(ProjectRoot, DependencyProject, Result, Resolving,
-                        Resolved);
+    if (!DependencyProject.HasProject)
+      throw std::runtime_error("dependency '" + Dependency.Name +
+                               "' is a workspace, not a project");
+    ResolveDependencies(CacheRoot, DependencyRoot, DependencyProject, Result,
+                        Resolving, Resolved);
     Result.push_back({DependencyRoot, std::move(DependencyProject)});
-    Resolving.erase(Dependency.Name);
-    Resolved.insert(Dependency.Name);
+    Resolving.erase(Key);
+    Resolved.insert(Key);
   }
 }
 
@@ -420,7 +612,7 @@ std::vector<ResolvedDependency> ResolveDependencies(const fs::path &Root,
   std::vector<ResolvedDependency> Result;
   std::set<std::string> Resolving;
   std::set<std::string> Resolved;
-  ResolveDependencies(Root, Project, Result, Resolving, Resolved);
+  ResolveDependencies(Root, Root, Project, Result, Resolving, Resolved);
   return Result;
 }
 
@@ -459,12 +651,15 @@ std::vector<std::string> CompilerCommand(const Config &Config,
   std::vector<std::string> Result{Config.Compiler, std::move(Action)};
   for (const auto &Path : Config.ModulePaths)
     Result.push_back("--module-path=" + Path);
-  if (Result[1] == "--emit-exe") {
+  const bool ProducesArtifact =
+      Result[1] == "--emit-exe" || Result[1] == "--emit-obj";
+  if (ProducesArtifact) {
     Result.push_back("--progress");
     Result.push_back("-O" + std::to_string(Config.Optimization));
     Result.push_back("--safe-level=" + std::to_string(Config.SafeLevel));
-    for (const auto &Source : Config.CSources)
-      Result.push_back("--c-source=" + Source);
+    if (Result[1] == "--emit-exe")
+      for (const auto &Source : Config.CSources)
+        Result.push_back("--c-source=" + Source);
     for (const auto &Argument : Config.CArguments)
       Result.push_back("--c-arg=" + Argument);
     Result.push_back("-o");
@@ -480,6 +675,10 @@ int Check(const fs::path &Root, const Config &Config) {
 }
 
 int Build(const fs::path &Root, const Config &Config) {
+  if (!Config.HasProject)
+    throw std::runtime_error("workspace root has no buildable project");
+  const std::string Action =
+      Config.Kind == BuildKind::Library ? "--emit-obj" : "--emit-exe";
   std::cerr << "[1/3] Preparing " << Config.Name << '\n';
   std::error_code Error;
   fs::create_directories(Root / Config.Output.parent_path(), Error);
@@ -489,12 +688,23 @@ int Build(const fs::path &Root, const Config &Config) {
   const auto Prepared = Prepare(Root, Config);
   std::cerr << "[2/3] Building " << Prepared.Entry.string() << " -> "
             << Config.Output.string() << '\n';
-  const int Status = Execute(Root, CompilerCommand(Prepared, "--emit-exe"));
+  const int Status = Execute(Root, CompilerCommand(Prepared, Action));
   if (Status == 0)
     std::cerr << "[3/3] Finished " << Config.Output.string() << '\n';
   else
     std::cerr << "Build failed (exit " << Status << ")\n";
   return Status;
+}
+
+int RunProject(const ProjectNode &Node,
+               const std::vector<std::string> &Arguments) {
+  if (Node.Project.Kind == BuildKind::Library)
+    throw std::runtime_error("library projects cannot be run");
+  if (const int Status = Build(Node.Root, Node.Project))
+    return Status;
+  std::vector<std::string> Command{(Node.Root / Node.Project.Output).string()};
+  Command.insert(Command.end(), Arguments.begin(), Arguments.end());
+  return Execute(Node.Root, Command);
 }
 
 int Package(const fs::path &Root, const Config &Config) {
@@ -571,18 +781,25 @@ void CreateProject(const fs::path &Root, std::string Name) {
 }
 
 void Help() {
-  std::cout << "Kelp - Kelyra project manager\n\n"
-               "usage: kelp <command> [arguments]\n\n"
-               "commands:\n"
-               "  new <name>    Create a project in ./<name>\n"
-               "  init [name]   Create a project in the current directory\n"
-               "  check         Type-check the project\n"
-               "  build [--debug] Build the executable (--debug uses -O0)\n"
-               "  output        Print the absolute executable path\n"
-               "  run [-- ...]  Build and run the project\n"
-               "  test          Check configured test sources\n"
-               "  package       Build and create a source archive\n"
-               "  help          Show this help\n";
+  std::cout
+      << "Kelp - Kelyra project manager\n\n"
+         "usage: kelp <command> [arguments]\n\n"
+         "commands:\n"
+         "  new <name>        Create a project in ./<name>\n"
+         "  init [name]       Create a project in the current directory\n"
+         "  members           List the workspace projects\n"
+         "  check [<member>] [--workspace]   Type-check a project\n"
+         "  build [<member>] [--debug] [--workspace]\n"
+         "                    Build it (--debug uses -O0)\n"
+         "  output [<member>] Print the absolute artifact path\n"
+         "  run [<member>] [-- ...]  Build and run an executable\n"
+         "  test [<member>] [--workspace]    Check test sources\n"
+         "  package [<member>] [--workspace] Build and archive sources\n"
+         "  help              Show this help\n\n"
+         "[workspace] members in kelp.toml nest subprojects, each with\n"
+         "its own kelp.toml. Dependencies use repository/revision for Git\n"
+         "or path for a local project. build.kind is 'executable' or\n"
+         "'library' (an object artifact).\n";
 }
 } // namespace
 
@@ -615,55 +832,93 @@ int main(int Argc, char **Argv) {
     }
 
     const auto Root = FindRoot();
-    const auto Project = LoadConfig(Root);
-    if (Command == "check") {
+    if (Command == "members") {
       if (Argc != 2)
-        throw std::runtime_error("usage: kelp check");
-      return Check(Root, Project);
-    }
-    if (Command == "build") {
-      if (Argc != 2 && !(Argc == 3 && std::string_view(Argv[2]) == "--debug"))
-        throw std::runtime_error("usage: kelp build [--debug]");
-      auto BuildProject = Project;
-      if (Argc == 3)
-        BuildProject.Optimization = 0;
-      return Build(Root, BuildProject);
-    }
-    if (Command == "output") {
-      if (Argc != 2)
-        throw std::runtime_error("usage: kelp output");
-      std::cout << (Root / Project.Output).string() << '\n';
+        throw std::runtime_error("usage: kelp members");
+      for (const auto &Node : LoadWorkspace(Root))
+        std::cout << RelativeNodePath(Node.Root, Root) << ' '
+                  << (Node.Project.HasProject ? Node.Project.Name : "-") << ' '
+                  << ProjectKindName(Node.Project) << ' '
+                  << (Node.Project.HasProject ? Node.Project.Output.string()
+                                              : std::string("-"))
+                  << '\n';
       return 0;
     }
-    if (Command == "run") {
-      if (const int Status = Build(Root, Project))
-        return Status;
-      std::vector<std::string> Arguments{(Root / Project.Output).string()};
-      int Start = 2;
-      if (Start < Argc && std::string_view(Argv[Start]) == "--")
-        ++Start;
-      for (int I = Start; I < Argc; ++I)
-        Arguments.emplace_back(Argv[I]);
-      return Execute(Root, Arguments);
+
+    const auto Nodes = LoadWorkspace(Root);
+    if (Command == "check") {
+      const auto Options = ParseCommandOptions(Argc, Argv, false);
+      for (const auto *Node : SelectTargets(Nodes, Options, false))
+        if (const int Status = Check(Node->Root, Node->Project))
+          return Status;
+      return 0;
     }
-    if (Command == "test") {
-      if (Argc != 2)
-        throw std::runtime_error("usage: kelp test");
-      const auto Prepared = Prepare(Root, Project);
-      if (Prepared.TestSources.empty())
-        return Execute(Root, CompilerCommand(Prepared, "--check"));
-      for (const auto &Source : Prepared.TestSources) {
-        auto Arguments = CompilerCommand(Prepared, "--check");
-        Arguments.back() = Source;
-        if (const int Status = Execute(Root, Arguments))
+    if (Command == "build") {
+      const auto Options = ParseCommandOptions(Argc, Argv, true);
+      for (const auto *Node : SelectTargets(Nodes, Options, false)) {
+        auto Project = Node->Project;
+        if (Options.Debug)
+          Project.Optimization = 0;
+        if (const int Status = Build(Node->Root, Project))
           return Status;
       }
       return 0;
     }
+    if (Command == "output") {
+      const auto Options = ParseCommandOptions(Argc, Argv, false);
+      const auto Targets = SelectTargets(Nodes, Options, true);
+      std::cout
+          << (Targets.front()->Root / Targets.front()->Project.Output).string()
+          << '\n';
+      return 0;
+    }
+    if (Command == "run") {
+      CommandOptions Options;
+      std::vector<std::string> ProgramArguments;
+      int I = 2;
+      for (; I < Argc; ++I) {
+        const std::string_view Argument = Argv[I];
+        if (Argument == "--") {
+          ++I;
+          break;
+        }
+        if (!Argument.empty() && Argument.front() == '-')
+          throw std::runtime_error("unknown option '" + std::string(Argument) +
+                                   "'");
+        if (Options.Selector)
+          throw std::runtime_error("usage: kelp run [<member>] [-- <args>]");
+        Options.Selector = std::string(Argument);
+      }
+      for (; I < Argc; ++I)
+        ProgramArguments.emplace_back(Argv[I]);
+      const auto Targets = SelectTargets(Nodes, Options, true);
+      return RunProject(*Targets.front(), ProgramArguments);
+    }
+    if (Command == "test") {
+      const auto Options = ParseCommandOptions(Argc, Argv, false);
+      for (const auto *Node : SelectTargets(Nodes, Options, false)) {
+        const auto Prepared = Prepare(Node->Root, Node->Project);
+        if (Prepared.TestSources.empty()) {
+          if (const int Status =
+                  Execute(Node->Root, CompilerCommand(Prepared, "--check")))
+            return Status;
+          continue;
+        }
+        for (const auto &Source : Prepared.TestSources) {
+          auto Arguments = CompilerCommand(Prepared, "--check");
+          Arguments.back() = Source;
+          if (const int Status = Execute(Node->Root, Arguments))
+            return Status;
+        }
+      }
+      return 0;
+    }
     if (Command == "package") {
-      if (Argc != 2)
-        throw std::runtime_error("usage: kelp package");
-      return Package(Root, Project);
+      const auto Options = ParseCommandOptions(Argc, Argv, false);
+      for (const auto *Node : SelectTargets(Nodes, Options, false))
+        if (const int Status = Package(Node->Root, Node->Project))
+          return Status;
+      return 0;
     }
     throw std::runtime_error("unknown command '" + Command + "'");
   } catch (const std::exception &Error) {
