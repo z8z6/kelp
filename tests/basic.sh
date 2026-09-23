@@ -62,6 +62,21 @@ grep -qx -- '--progress' "$FAKE_KELYRA_LOG"
 grep -qx -- '-O0' "$FAKE_KELYRA_LOG"
 "$kelp" build
 grep -qx -- '-O3' "$FAKE_KELYRA_LOG"
+sed -i '/optimization = 3/a runtime = "freestanding"' kelp.toml
+"$kelp" build
+grep -qx -- '--runtime=freestanding' "$FAKE_KELYRA_LOG"
+sed -i '/runtime = "freestanding"/a target = "x86_64-pc-windows-msvc"' kelp.toml
+"$kelp" build
+grep -qx -- '--target=x86_64-pc-windows-msvc' "$FAKE_KELYRA_LOG"
+sed -i '/target = "x86_64-pc-windows-msvc"/a windows-import-libraries = ["Synchronization.lib"]' kelp.toml
+"$kelp" build
+grep -qx -- '--link-input=Synchronization.lib' "$FAKE_KELYRA_LOG"
+sed -i 's/target = "x86_64-pc-windows-msvc"/target = "x86_64-unknown-linux-gnu"/' kelp.toml
+"$kelp" build
+if grep -qx -- '--link-input=Synchronization.lib' "$FAKE_KELYRA_LOG"; then
+  echo "Windows import library leaked into Linux build" >&2
+  exit 1
+fi
 if FAKE_KELYRA_FAIL=1 "$kelp" build 2>"$tmp/failed-progress"; then
   echo "compiler failure was ignored" >&2
   exit 1
@@ -148,6 +163,7 @@ entry = "src/math.kly"
 [build]
 compiler = "$fake"
 kind = "library"
+windows-import-libraries = ["Synchronization.lib"]
 EOF
 cat > workspace/libs/math/src/math.kly <<'EOF'
 pub fn answer() -> i32 { return 0; }
@@ -159,13 +175,16 @@ entry = "src/main.kly"
 
 [build]
 compiler = "$fake"
+target = "x86_64-pc-windows-msvc"
 c-sources = ["src/runtime.c"]
+c-libraries = ["src/prebuilt-c.a"]
 
 [dependencies.math]
 path = "../libs/math"
 EOF
 printf 'pub fn main() -> i32 { return 0; }\n' > workspace/app/src/main.kly
 printf 'int app_runtime(void) { return 0; }\n' > workspace/app/src/runtime.c
+printf 'prebuilt C library\n' > workspace/app/src/prebuilt-c.a
 
 cd workspace
 "$kelp" members | grep -qx 'libs/math math library .kelp/build/libs/math/math.o'
@@ -206,8 +225,18 @@ grep -qx -- "--external-path=$tmp/workspace/libs/math/src" "$FAKE_KELYRA_LOG"
 grep -qx -- "--link-input=$tmp/workspace/.kelp/build/libs/math/math.o" \
   "$FAKE_KELYRA_LOG"
 grep -q -- "--c-source=src/runtime.c" "$FAKE_KELYRA_LOG"
+grep -qx -- "--link-input=$tmp/workspace/app/src/prebuilt-c.a" "$FAKE_KELYRA_LOG"
+grep -qx -- '--link-input=Synchronization.lib' "$FAKE_KELYRA_LOG"
 test -f .kelp/build/libs/math/math.o
 test ! -e app/.kelp
+
+# An explicitly provided library replaces compilation of the dependency.
+printf 'prebuilt Kelyra library\n' > libs/math/prebuilt.o
+printf '\nlibrary = "prebuilt.o"\n' >> app/kelp.toml
+rm -f .kelp/build/libs/math/math.o
+"$kelp" build app
+grep -qx -- "--link-input=$tmp/workspace/libs/math/prebuilt.o" "$FAKE_KELYRA_LOG"
+test ! -e .kelp/build/libs/math/math.o
 
 # check, test, and package accept --workspace.
 "$kelp" check --workspace

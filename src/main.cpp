@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cctype>
 #include <cerrno>
 #include <charconv>
@@ -34,6 +35,7 @@ struct Config {
     std::string Repository;
     std::string Revision;
     fs::path Path;
+    fs::path Library;
     bool Local = false;
   };
 
@@ -47,7 +49,11 @@ struct Config {
   fs::path PackageOutput;
   unsigned Optimization = 0;
   unsigned SafeLevel = 0;
+  std::string Runtime = "host";
+  std::string Target;
   std::vector<std::string> CSources;
+  std::vector<std::string> CLibraries;
+  std::vector<std::string> WindowsImportLibraries;
   std::vector<std::string> CArguments;
   std::vector<std::string> ModulePaths;
   std::vector<std::string> ExternalPaths;
@@ -70,6 +76,27 @@ bool SafeRelativePath(const fs::path &Path) {
     if (Part == "..")
       return false;
   return true;
+}
+
+bool ValidWindowsImportLibrary(std::string_view Name) {
+  if (Name.size() <= 4 || Name.substr(Name.size() - 4) != ".lib")
+    return false;
+  for (const unsigned char Character : Name)
+    if (!std::isalnum(Character) && Character != '_' && Character != '-' &&
+        Character != '.')
+      return false;
+  return true;
+}
+
+bool TargetsWindows(std::string_view Target) {
+  if (!Target.empty())
+    return Target.find("windows") != std::string_view::npos ||
+           Target.find("win32") != std::string_view::npos;
+#ifdef _WIN32
+  return true;
+#else
+  return false;
+#endif
 }
 
 std::string Trim(std::string_view Text) {
@@ -256,10 +283,14 @@ BuildKind ParseBuildKind(const std::string &Value) {
 Config LoadConfig(const fs::path &Root) {
   const auto Values = ParseToml(Root / "kelp.toml");
   static const std::vector<std::string> Known{
-      "project.name",       "project.version",  "project.entry",
-      "build.compiler",     "build.kind",       "build.output",
-      "build.optimization", "build.safe-level", "build.c-sources",
-      "build.c-args",       "package.output",   "test.sources",
+      "project.name",       "project.version",
+      "project.entry",      "build.compiler",
+      "build.kind",         "build.output",
+      "build.optimization", "build.safe-level",
+      "build.c-sources",    "build.c-args",
+      "build.c-libraries",  "build.runtime",
+      "build.target",       "build.windows-import-libraries",
+      "package.output",     "test.sources",
       "workspace.members"};
   std::set<std::string> DependencyNames;
   for (const auto &[Key, Ignored] : Values) {
@@ -276,8 +307,8 @@ Config LoadConfig(const fs::path &Root) {
         throw std::runtime_error("invalid dependency key '" + Key + "'");
       const auto Name = Rest.substr(0, Dot);
       const auto Field = Rest.substr(Dot + 1);
-      if (!ValidName(Name) ||
-          (Field != "repository" && Field != "revision" && Field != "path"))
+      if (!ValidName(Name) || (Field != "repository" && Field != "revision" &&
+                               Field != "path" && Field != "library"))
         throw std::runtime_error("invalid dependency key '" + Key + "'");
       DependencyNames.insert(Name);
       Found = true;
@@ -311,8 +342,20 @@ Config LoadConfig(const fs::path &Root) {
     throw std::runtime_error("build.safe-level must be at most 255");
   Result.Optimization = static_cast<unsigned>(Optimization);
   Result.SafeLevel = static_cast<unsigned>(SafeLevel);
+  Result.Runtime =
+      Get<std::string>(Values, "build.runtime", std::string("host"));
+  Result.Target = Get<std::string>(Values, "build.target", std::string{});
+  if (Result.Runtime != "host" && Result.Runtime != "freestanding")
+    throw std::runtime_error("build.runtime must be 'host' or 'freestanding'");
+  if (Result.Kind == BuildKind::Library && Result.Runtime == "freestanding")
+    throw std::runtime_error(
+        "build.runtime = 'freestanding' requires an executable project");
   Result.CSources = Get<std::vector<std::string>>(Values, "build.c-sources",
                                                   std::vector<std::string>{});
+  Result.CLibraries = Get<std::vector<std::string>>(Values, "build.c-libraries",
+                                                    std::vector<std::string>{});
+  Result.WindowsImportLibraries = Get<std::vector<std::string>>(
+      Values, "build.windows-import-libraries", std::vector<std::string>{});
   Result.CArguments = Get<std::vector<std::string>>(Values, "build.c-args",
                                                     std::vector<std::string>{});
   Result.TestSources = Get<std::vector<std::string>>(
@@ -346,6 +389,14 @@ Config LoadConfig(const fs::path &Root) {
     for (const auto &Source : Result.CSources)
       if (!SafeRelativePath(Source))
         throw std::runtime_error("build.c-sources must contain relative paths");
+    for (const auto &Library : Result.CLibraries)
+      if (!SafeRelativePath(Library))
+        throw std::runtime_error(
+            "build.c-libraries must contain relative paths");
+    for (const auto &Library : Result.WindowsImportLibraries)
+      if (!ValidWindowsImportLibrary(Library))
+        throw std::runtime_error(
+            "build.windows-import-libraries must contain bare .lib names");
     for (const auto &Source : Result.TestSources)
       if (!SafeRelativePath(Source))
         throw std::runtime_error("test.sources must contain relative paths");
@@ -360,6 +411,11 @@ Config LoadConfig(const fs::path &Root) {
         Values, "dependencies." + Name + ".revision", std::string{});
     const auto Path = Get<std::string>(Values, "dependencies." + Name + ".path",
                                        std::string{});
+    Dependency.Library = Get<std::string>(
+        Values, "dependencies." + Name + ".library", std::string{});
+    if (!Dependency.Library.empty() &&
+        Dependency.Library.native().front() == '-')
+      throw std::runtime_error("invalid dependency library for '" + Name + "'");
     if (!Path.empty()) {
       if (!Repository.empty() || !Revision.empty())
         throw std::runtime_error("dependency '" + Name +
@@ -646,6 +702,7 @@ int Execute(const fs::path &Root, const std::vector<std::string> &Arguments) {
 struct ResolvedDependency {
   fs::path Root;
   Config Project;
+  fs::path PrebuiltLibrary;
 };
 
 struct DependencyUse {
@@ -736,9 +793,24 @@ void ResolveDependencies(const fs::path &CacheRoot, const fs::path &ProjectRoot,
     if (!DependencyProject.HasProject)
       throw std::runtime_error("dependency '" + Dependency.Name +
                                "' is a workspace, not a project");
+    fs::path PrebuiltLibrary;
+    if (!Dependency.Library.empty()) {
+      if (DependencyProject.Kind != BuildKind::Library)
+        throw std::runtime_error(
+            "dependency '" + Dependency.Name +
+            "' provides a library but is not a library project");
+      PrebuiltLibrary = Dependency.Library.is_absolute()
+                            ? Dependency.Library
+                            : DependencyRoot / Dependency.Library;
+      PrebuiltLibrary = PrebuiltLibrary.lexically_normal();
+      if (!fs::is_regular_file(PrebuiltLibrary))
+        throw std::runtime_error("missing prebuilt library: " +
+                                 PrebuiltLibrary.string());
+    }
     ResolveDependencies(CacheRoot, DependencyRoot, DependencyProject, Result,
                         Resolving, Resolved);
-    Result.push_back({DependencyRoot, std::move(DependencyProject)});
+    Result.push_back({DependencyRoot, std::move(DependencyProject),
+                      std::move(PrebuiltLibrary)});
     Resolving.erase(Key);
     Resolved.insert(Key);
   }
@@ -783,21 +855,37 @@ PreparedProject Prepare(const fs::path &Root, const Config &Project) {
   Result.ModulePaths.push_back(fs::absolute(Root / Project.Entry.parent_path())
                                    .lexically_normal()
                                    .string());
+  for (const auto &Library : Project.CLibraries)
+    Result.LinkInputs.push_back(
+        fs::absolute(Root / Library).lexically_normal().string());
   // Remove the staging tree created by older Kelp versions so no stale copies
   // remain next to the originals.
   std::error_code Error;
   fs::remove_all(Root / ".kelp/stage", Error);
-  if (Project.Dependencies.empty())
+  if (Project.Dependencies.empty()) {
+    if (TargetsWindows(Result.Target))
+      Result.LinkInputs.insert(Result.LinkInputs.end(),
+                               Project.WindowsImportLibraries.begin(),
+                               Project.WindowsImportLibraries.end());
     return Prepared;
+  }
   const auto CacheRoot = Project.CacheRoot.empty() ? Root : Project.CacheRoot;
   for (const auto &Dependency : ResolveDependencies(CacheRoot, Root, Project)) {
     const auto DependencySourceRoot = Dependency.Project.Entry.parent_path();
     const auto AbsoluteSourceRoot =
         fs::absolute(Dependency.Root / DependencySourceRoot).lexically_normal();
     Result.ModulePaths.push_back(AbsoluteSourceRoot.string());
-    for (const auto &Source : Dependency.Project.CSources)
-      Result.CSources.push_back(
-          fs::absolute(Dependency.Root / Source).string());
+    if (Dependency.Project.Kind != BuildKind::Library)
+      for (const auto &Source : Dependency.Project.CSources)
+        Result.CSources.push_back(
+            fs::absolute(Dependency.Root / Source).string());
+    for (const auto &Library : Dependency.Project.CLibraries)
+      Result.LinkInputs.push_back(
+          fs::absolute(Dependency.Root / Library).lexically_normal().string());
+    Result.WindowsImportLibraries.insert(
+        Result.WindowsImportLibraries.end(),
+        Dependency.Project.WindowsImportLibraries.begin(),
+        Dependency.Project.WindowsImportLibraries.end());
     Result.CArguments.insert(Result.CArguments.end(),
                              Dependency.Project.CArguments.begin(),
                              Dependency.Project.CArguments.end());
@@ -807,10 +895,17 @@ PreparedProject Prepare(const fs::path &Root, const Config &Project) {
       auto DependencyProject = Dependency.Project;
       DependencyProject.BuildRoot = BuildDirectory(Dependency.Root, CacheRoot);
       Result.ExternalPaths.push_back(AbsoluteSourceRoot.string());
-      Result.LinkInputs.push_back(ArtifactPath(DependencyProject).string());
+      Result.LinkInputs.push_back(Dependency.PrebuiltLibrary.empty()
+                                      ? ArtifactPath(DependencyProject).string()
+                                      : Dependency.PrebuiltLibrary.string());
     }
     Prepared.Dependencies.push_back(Dependency);
   }
+  if (TargetsWindows(Result.Target))
+    for (const auto &Library : Result.WindowsImportLibraries)
+      if (std::find(Result.LinkInputs.begin(), Result.LinkInputs.end(),
+                    Library) == Result.LinkInputs.end())
+        Result.LinkInputs.push_back(Library);
   return Prepared;
 }
 
@@ -827,9 +922,13 @@ std::vector<std::string> CompilerCommand(const Config &Config,
     Result.push_back("--progress");
     Result.push_back("-O" + std::to_string(Config.Optimization));
     Result.push_back("--safe-level=" + std::to_string(Config.SafeLevel));
+    if (!Config.Target.empty())
+      Result.push_back("--target=" + Config.Target);
+    if (Result[1] == "--emit-exe")
+      Result.push_back("--runtime=" + Config.Runtime);
+    for (const auto &Source : Config.CSources)
+      Result.push_back("--c-source=" + Source);
     if (Result[1] == "--emit-exe") {
-      for (const auto &Source : Config.CSources)
-        Result.push_back("--c-source=" + Source);
       for (const auto &Input : Config.LinkInputs)
         Result.push_back("--link-input=" + Input);
     }
@@ -873,9 +972,11 @@ int Build(const fs::path &Root, const Config &Config,
   // It builds with the consumer's toolchain and shares its dependency cache, so
   // a relative compiler path in the dependency still resolves.
   for (const auto &Dependency : Prepared.Dependencies)
-    if (Dependency.Project.Kind == BuildKind::Library) {
+    if (Dependency.Project.Kind == BuildKind::Library &&
+        Dependency.PrebuiltLibrary.empty()) {
       auto LibraryProject = Dependency.Project;
       LibraryProject.Compiler = Prepared.Project.Compiler;
+      LibraryProject.Target = Prepared.Project.Target;
       LibraryProject.CacheRoot = Config.CacheRoot;
       LibraryProject.BuildRoot =
           BuildDirectory(Dependency.Root, Config.CacheRoot);

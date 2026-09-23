@@ -27,7 +27,11 @@ kind = "executable"
 output = "hello"
 optimization = 0
 safe-level = 0
+runtime = "host"
+target = ""
 c-sources = []
+c-libraries = []
+windows-import-libraries = []
 c-args = []
 
 [package]
@@ -108,18 +112,45 @@ A library is compiled once and linked, not copied into every consumer. When a
 project depends on a library, Kelp builds that library's object, passes its
 source directory to Kelyra as an `--external-path` (so the consumer emits only
 declarations for its modules) and passes the object as a `--link-input`. The
-library's configured C sources are still linked into the final executable. That
+library's configured C sources are compiled into that object. That
 is how subprojects reference each other: put the shared code in a `library`
 project and depend on it; executable-kind dependencies stay source-level. A
 library dependency builds with the consumer's compiler and shares its
 dependency cache.
+
+For an existing library, set `library` on the dependency. Kelp still uses its
+source directory for module declarations, but skips its build and links the
+supplied object or archive:
+
+```toml
+[dependencies.math]
+path = "../libs/math"
+library = "prebuilt/math.o" # relative to the dependency project
+```
+
+`build.c-sources` compiles C source files; `build.c-libraries` links existing
+C objects or archives. List only the C sources that still need compilation.
+`build.windows-import-libraries` lists bare Windows SDK `.lib` names, such as
+`Synchronization.lib`. Kelp passes them only for Windows targets, including
+when a library dependency declares them; non-Windows builds ignore them.
+
+`build.runtime = "freestanding"` selects Kelyra's explicit startup and
+`-nostdlib` executable link on supported targets (Linux x86-64 and Windows
+x86-64). The default `"host"` keeps the platform C runtime startup. This
+setting applies to executable projects; library projects inherit their
+consumer's link mode.
+
+`build.target` optionally selects an LLVM target triple for compilation;
+empty means the native target. Cross-platform linking still requires a
+matching linker and platform system libraries.
 
 ## Dependencies
 
 Dependencies use Git repositories or local paths. Kelp clones Git dependencies
 into `.kelp/dependencies`, checks out `revision` when provided, and passes each
 dependency source directory to Kelyra as a `--module-path` search directory.
-Their configured C sources are compiled into the final executable. Sources are
+Executable dependencies' C sources are compiled into the final executable;
+library dependencies include them in their own object. Sources are
 compiled where they live: Kelp never copies them into a staging tree, so
 diagnostics and debug information point at the real files. Modules in the
 project's own source directory take priority, followed by dependency
